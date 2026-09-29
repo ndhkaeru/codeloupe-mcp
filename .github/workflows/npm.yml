@@ -75,6 +75,9 @@ jobs:
           if (server.name !== pkg.mcpName) {
             mismatches.push(`server.name=${server.name} != package.mcpName=${pkg.mcpName}`);
           }
+          if (typeof server.description !== 'string' || server.description.length > 100) {
+            mismatches.push(`server.description must be a string of at most 100 characters`);
+          }
           if (mismatches.length) {
             console.error('server.json is out of sync with packages/npm/package.json:');
             for (const mismatch of mismatches) console.error(`  ${mismatch}`);
@@ -132,7 +135,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
 
       - name: Validate MCP registry metadata
         run: |
@@ -142,6 +145,9 @@ jobs:
           const mismatches = [];
           if (server.version !== pkg.version) mismatches.push(`server.version=${server.version} != package.version=${pkg.version}`);
           if (server.name !== pkg.mcpName) mismatches.push(`server.name=${server.name} != package.mcpName=${pkg.mcpName}`);
+          if (typeof server.description !== 'string' || server.description.length > 100) {
+            mismatches.push(`server.description must be a string of at most 100 characters`);
+          }
           for (const packageEntry of server.packages || []) {
             if (packageEntry.identifier === pkg.name && packageEntry.version !== pkg.version) {
               mismatches.push(`server package ${packageEntry.identifier} version=${packageEntry.version} != package.version=${pkg.version}`);
