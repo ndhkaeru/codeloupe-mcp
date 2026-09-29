@@ -30,11 +30,19 @@ function executableName() {
   return process.platform === 'win32' ? 'codeloupe-mcp.exe' : 'codeloupe-mcp';
 }
 
-function candidates() {
+function binaryOverride(environment = process.env) {
+  return environment.CODELOUPE_MCP_BINARY
+    || environment.codeloupe_mcp_BINARY
+    || environment.CODEBASE_MCP_BINARY
+    || null;
+}
+
+function candidates(environment = process.env) {
   const name = executableName();
   const items = [];
-  if (process.env.CODELOUPE_MCP_BINARY) {
-    items.push(process.env.CODELOUPE_MCP_BINARY);
+  const override = binaryOverride(environment);
+  if (override) {
+    items.push(override);
   }
   items.push(path.join(packageRoot, 'native', platformKey(), name));
   items.push(path.join(repoRoot, 'target', 'release', name));
@@ -87,4 +95,8 @@ function main() {
   });
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = { binaryOverride };

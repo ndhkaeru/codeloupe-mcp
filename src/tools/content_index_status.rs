@@ -44,8 +44,8 @@ fn parse_paths(args: &Value) -> Result<Vec<PathBuf>> {
     let paths = paths
         .iter()
         .filter_map(|path| path.as_str())
-        .map(crate::common::resolve_tool_path)
-        .collect::<Vec<_>>();
+        .map(crate::common::resolve_existing_tool_path)
+        .collect::<Result<Vec<_>>>()?;
     if paths.is_empty() {
         return Err(anyhow::anyhow!("paths must contain at least one path"));
     }

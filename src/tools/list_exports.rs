@@ -53,9 +53,14 @@ pub async fn execute(args: &Value) -> Result<Value> {
     );
 
     Ok(json!({
-        "file": crate::common::normalize_display_path(&path),
+        "path": crate::common::normalize_display_path(&path),
         "language": parsed.language_name,
         "exports": exports,
+        "export_defaults": if parsed.language_kind == LanguageKind::Rust {
+            Some(json!({"kind": "pub_item"}))
+        } else {
+            None
+        },
         "total_exports": exports.len()
     }))
 }
@@ -121,7 +126,6 @@ fn collect_rust_export(node: Node<'_>, source: &[u8], exports: &mut Vec<Value>) 
 
         exports.push(json!({
             "line": node.start_position().row + 1,
-            "kind": "pub_item",
             "name": declaration_name(&node, source),
             "source": Value::Null,
             "statement": trimmed.lines().next().unwrap_or(trimmed)

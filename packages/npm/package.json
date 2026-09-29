@@ -1,6 +1,6 @@
 {
   "name": "@ndhkaeru/codeloupe-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local-first MCP server for code search, code intelligence, repository comparison, and safe file edits",
   "license": "Apache-2.0",
   "repository": {
@@ -23,7 +23,8 @@
   ],
   "scripts": {
     "prepare:native": "node scripts/prepare-npm-assets.js",
-    "smoke": "node bin/codeloupe-mcp.js --version"
+    "smoke": "node bin/codeloupe-mcp.js --version",
+    "test:env": "node scripts/test-env-aliases.js"
   },
   "engines": {
     "node": ">=18"

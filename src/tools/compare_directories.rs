@@ -7,33 +7,22 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tokio::task;
 
-use super::path_filters::{apply_walk_overrides, parse_pattern_strings};
+use super::output_format::{OutputFormat, parse_output_format};
+use super::path_filters::{
+    apply_walk_overrides, default_generated_vendor_globs, parse_pattern_strings,
+};
 
-const DEFAULT_MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
+use crate::limits::{DEFAULT_COMPARE_FILE_SIZE_BYTES, MAX_COMPARE_FILE_SIZE_BYTES};
+
+const DEFAULT_MAX_FILE_SIZE: u64 = DEFAULT_COMPARE_FILE_SIZE_BYTES;
 const DEFAULT_MAX_DIFF_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_FILES: usize = 20_000;
-const MAX_FILE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
+const MAX_FILE_SIZE_LIMIT: usize = MAX_COMPARE_FILE_SIZE_BYTES;
 const MAX_DIFF_BYTES_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_FILES_LIMIT: usize = 100_000;
 const DEFAULT_TOP_LIMIT: usize = 10;
 const TOP_LEVEL_LIST_LIMIT: usize = 100;
 const GROUPED_PATH_LIMIT: usize = 50;
-
-const DEFAULT_EXCLUDES: &[&str] = &[
-    ".git/**",
-    ".hg/**",
-    ".svn/**",
-    "node_modules/**",
-    "vendor/**",
-    "dist/**",
-    "build/**",
-    "target/**",
-    ".next/**",
-    ".cache/**",
-    "__pycache__/**",
-    ".venv/**",
-    "coverage/**",
-];
 
 #[derive(Clone)]
 struct Options {
@@ -45,12 +34,6 @@ struct Options {
     detect_renames: bool,
     rename_similarity_threshold: f64,
     output_format: OutputFormat,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-enum OutputFormat {
-    Json,
-    Markdown,
 }
 
 #[derive(Clone)]
@@ -83,14 +66,14 @@ pub fn schema() -> Value {
                 "left_path": { "type": "string", "description": "Base/source directory. Relative paths resolve against the active workspace." },
                 "right_path": { "type": "string", "description": "Changed/target directory to compare against left_path. Relative paths resolve against the active workspace." },
                 "includes": { "type": "array", "items": { "type": "string" }, "description": "Glob include filters for focused reviews, e.g. [\"src/**\", \"**/*.rs\"]. Omit to scan all supported files." },
-                "excludes": { "type": "array", "items": { "type": "string" }, "description": "Extra glob excludes. Common generated/vendor directories such as .git, node_modules, target, build, dist, and coverage are always excluded." },
+                "excludes": { "type": "array", "items": { "type": "string" }, "description": "Extra glob excludes. Shared generated/vendor defaults include .git, node_modules, target, build, dist, obj, coverage, and similar directories. bin is excluded only for recognized .NET/Java workspaces." },
                 "max_file_size": { "type": "integer", "description": "Maximum file size to read or diff in bytes. Larger files are summarized as skipped. Defaults to 2 MiB." },
                 "max_diff_bytes": { "type": "integer", "description": "Maximum total unified diff bytes returned across all files. Lower this for first-pass reviews. Defaults to 256 KiB." },
                 "max_files": { "type": "integer", "description": "Maximum discovered files per side before aborting to protect the agent from huge trees. Defaults to 20000." },
-                "include_content_diff": { "type": "boolean", "description": "Include bounded unified diffs for modified text files. Set false for a faster inventory-only pass. Defaults to true." },
+                "include_content_diff": { "type": "boolean", "description": "Include bounded unified diffs for modified text files. Opt in after the default inventory-only pass. Defaults to false." },
                 "summary_only": { "type": "boolean", "description": "Return counts, grouped summaries, and changed file lists without per-file diff payloads. Good first pass for large changes. Defaults to false." },
                 "detect_renames": { "type": "boolean", "description": "Detect exact and similar-content renames among added/deleted files. Defaults to true." },
-                "rename_similarity_threshold": { "type": "number", "description": "Line-similarity threshold for fuzzy rename detection, from 0.0 to 1.0. Defaults to 0.85." },
+                "rename_similarity_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Line-similarity threshold for fuzzy rename detection, from 0.0 to 1.0. Defaults to 0.85." },
                 "output_format": { "type": "string", "enum": ["json", "markdown"], "description": "Return structured JSON for tool chaining or compact Markdown for direct human review. Defaults to json." }
             },
             "required": ["left_path", "right_path"]
@@ -120,10 +103,8 @@ fn execute_blocking(args: Value) -> Result<Value> {
     ensure_dir(&left_root, left_raw)?;
     ensure_dir(&right_root, right_raw)?;
 
-    let mut exclude_globs: Vec<String> = DEFAULT_EXCLUDES
-        .iter()
-        .map(|item| item.to_string())
-        .collect();
+    let mut exclude_globs =
+        default_generated_vendor_globs(&[left_root.clone(), right_root.clone()]);
     exclude_globs.extend(parse_pattern_strings(args.get("excludes")));
     let include_globs = parse_pattern_strings(args.get("includes"));
     let options = Options {
@@ -145,7 +126,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
         include_content_diff: args
             .get("include_content_diff")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true),
+            .unwrap_or(false),
         summary_only: args
             .get("summary_only")
             .and_then(|v| v.as_bool())
@@ -155,7 +136,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         rename_similarity_threshold: arg_f64(&args, "rename_similarity_threshold", 0.85),
-        output_format: parse_output_format(args.get("output_format"))?,
+        output_format: parse_output_format(args.get("output_format"), false)?,
     };
 
     let left_collected = collect_files(
@@ -214,21 +195,12 @@ fn execute_blocking(args: Value) -> Result<Value> {
             .get(&relative_path)
             .expect("right common file exists");
 
-        if options.summary_only {
-            if left.size != right.size || left.modified_at != right.modified_at {
-                modified.push(metadata_only_change(&relative_path, left, right));
-            } else {
-                unchanged_count += 1;
-            }
-            continue;
-        }
-
         if left.size > options.max_file_size || right.size > options.max_file_size {
             skipped_files.push(json!({
                 "path": relative_path,
                 "reason": "file_too_large",
-                "left_size": left.size,
-                "right_size": right.size
+                "left_size_bytes": left.size,
+                "right_size_bytes": right.size
             }));
             continue;
         }
@@ -261,13 +233,18 @@ fn execute_blocking(args: Value) -> Result<Value> {
             continue;
         }
 
+        if options.summary_only {
+            modified.push(metadata_only_change(&relative_path, left, right));
+            continue;
+        }
+
         if crate::tools::read_file::is_probably_binary(&left_bytes)
             || crate::tools::read_file::is_probably_binary(&right_bytes)
         {
             binary_files.push(json!({
                 "path": relative_path,
-                "left_size": left.size,
-                "right_size": right.size,
+                "left_size_bytes": left.size,
+                "right_size_bytes": right.size,
                 "left_modified_at": left.modified_at,
                 "right_modified_at": right.modified_at,
                 "status": "modified"
@@ -319,9 +296,9 @@ fn execute_blocking(args: Value) -> Result<Value> {
             "inserted_lines": inserted_lines_total,
             "deleted_lines": deleted_lines_total,
             "diff_bytes_returned": diff_bytes_used,
-            "partial": partial
+            "complete": !partial
         },
-        "partial": partial,
+        "complete": !partial,
         "limit_reached": partial,
         "limit_reason": if partial { Some("max_files") } else { None },
         "top_changed_directories": top_changed_directories,
@@ -329,13 +306,13 @@ fn execute_blocking(args: Value) -> Result<Value> {
         "changed_files_by_directory": changed_files_by_directory,
         "risk_hints": risk_hints,
         "details_limit": TOP_LEVEL_LIST_LIMIT,
-        "details_truncated": {
-            "added_files": added_files_truncated,
-            "deleted_files": deleted_files_truncated,
-            "renamed_files": renamed_files_truncated,
-            "modified_files": modified_files_truncated,
-            "binary_files": binary_files_truncated,
-            "skipped_files": skipped_files_truncated
+        "details_complete": {
+            "added_files": !added_files_truncated,
+            "deleted_files": !deleted_files_truncated,
+            "renamed_files": !renamed_files_truncated,
+            "modified_files": !modified_files_truncated,
+            "binary_files": !binary_files_truncated,
+            "skipped_files": !skipped_files_truncated
         },
         "added_files": capped_strings(&added),
         "deleted_files": capped_strings(&deleted),
@@ -581,8 +558,8 @@ fn sizes_can_be_similar(left_size: u64, right_size: u64, similarity_threshold: f
 fn metadata_only_change(relative_path: &str, left: &FileInfo, right: &FileInfo) -> Value {
     json!({
         "path": relative_path,
-        "left_size": left.size,
-        "right_size": right.size,
+        "left_size_bytes": left.size,
+        "right_size_bytes": right.size,
         "left_modified_at": left.modified_at,
         "right_modified_at": right.modified_at,
         "risk_category": risk_category(relative_path),
@@ -614,8 +591,8 @@ fn build_text_change(
 
     let mut item = json!({
         "path": relative_path,
-        "left_size": left.size,
-        "right_size": right.size,
+        "left_size_bytes": left.size,
+        "right_size_bytes": right.size,
         "left_modified_at": left.modified_at,
         "right_modified_at": right.modified_at,
         "left_encoding": left_encoding,
@@ -702,7 +679,12 @@ fn changed_by_directory(paths: &[String]) -> BTreeMap<String, Vec<String>> {
 }
 
 fn top_directory(path: &str) -> String {
-    path.split('/').next().unwrap_or(".").to_string()
+    // Files directly under the compared roots belong to ".", not to a
+    // "directory" named after the file itself.
+    match path.split_once('/') {
+        Some((directory, _)) => directory.to_string(),
+        None => ".".to_string(),
+    }
 }
 
 fn extension_key(path: &str) -> String {
@@ -872,14 +854,6 @@ fn arg_f64(args: &Value, key: &str, default_value: f64) -> f64 {
         .and_then(|value| value.as_f64())
         .unwrap_or(default_value)
         .clamp(0.0, 1.0)
-}
-
-fn parse_output_format(value: Option<&Value>) -> Result<OutputFormat> {
-    match value.and_then(|value| value.as_str()).unwrap_or("json") {
-        "json" => Ok(OutputFormat::Json),
-        "markdown" => Ok(OutputFormat::Markdown),
-        other => Err(anyhow::anyhow!("Unsupported output_format: {}", other)),
-    }
 }
 
 fn build_warnings(max_diff_bytes: usize, diff_bytes_used: usize) -> Vec<String> {

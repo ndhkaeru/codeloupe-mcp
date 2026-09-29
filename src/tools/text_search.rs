@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
-use glob::Pattern;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::sinks::UTF8;
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
+};
 use ignore::{WalkBuilder, WalkState};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,30 +14,23 @@ use std::thread;
 use std::time::Instant;
 use tokio::task;
 
-use super::path_filters::{apply_walk_overrides, compile_patterns, parse_pattern_strings};
+use super::output_format::{OutputFormat, parse_output_format};
+use super::path_filters::{
+    Pattern, apply_walk_overrides, compile_patterns, configure_walk_filters,
+    default_generated_vendor_globs, filtered_scope_warnings, is_direct_vendor_or_generated_scope,
+    is_vcs_metadata_dir, matches_patterns_or_ancestors, parse_pattern_strings,
+    passes_patterns as path_passes_patterns,
+};
+use super::search_snippet::{render_line_start, render_match_line};
+use crate::cancellation::CancellationToken;
 use crate::common::insert_object_field;
-use crate::indexer::query_tantivy_content_candidates;
+use crate::indexer::{content_policy_allows_path, query_tantivy_content_candidates};
 
 const DEFAULT_MAX_RESULTS: usize = 100;
 const MAX_RETURNED_MATCHES: usize = 1_000;
 const DEFAULT_MAX_LINE_LENGTH: usize = 240;
 const MAX_LINE_LENGTH: usize = 4_000;
-const MAX_SEARCH_FILE_BYTES: u64 = 5 * 1024 * 1024;
-const DEFAULT_FALLBACK_EXCLUDES: &[&str] = &[
-    "out/**",
-    "**/out/**",
-    "generated/**",
-    "**/generated/**",
-    ".git/**",
-    "**/.git/**",
-    "node_modules/**",
-    "**/node_modules/**",
-    "target/**",
-    "**/target/**",
-    "third_party/**",
-    "**/third_party/**",
-];
-
+const MAX_UNINDEXED_FILES_REPORTED: usize = 100;
 static TOTAL_TEXT_SEARCHES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_GREP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REFUSED_LARGE_SCOPE: AtomicU64 = AtomicU64::new(0);
@@ -47,10 +40,14 @@ static LAST_SEARCH_DURATION_MS: AtomicU64 = AtomicU64::new(0);
 pub struct SearchMatch {
     pub file: String,
     pub line: u64,
-    pub snippet: String,
     pub line_text: String,
+    pub match_column: usize,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub line_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_before: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_after: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -88,11 +85,23 @@ struct SearchStats {
 struct SharedSearchState {
     matches: Mutex<Vec<SearchMatch>>,
     seen: Mutex<HashSet<PathBuf>>,
+    unindexed_seen: Mutex<HashSet<PathBuf>>,
+    unindexed_files: Mutex<Vec<String>>,
+    unindexed_files_count: AtomicUsize,
     files_considered: AtomicUsize,
     files_searched: AtomicUsize,
     search_errors: AtomicUsize,
     files_skipped_large: AtomicUsize,
     stop: AtomicBool,
+    cancellation: Option<CancellationToken>,
+}
+
+impl SharedSearchState {
+    fn cancellation_requested(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
 }
 
 #[derive(Debug)]
@@ -101,11 +110,43 @@ struct FallbackPlan {
     reason: Option<&'static str>,
 }
 
+const DIAGNOSTIC_FIELDS: &[&str] = &[
+    "files_searched",
+    "files_considered",
+    "files_skipped_large",
+    "search_errors",
+    "duration_ms",
+    "case_mode",
+    "content_index_used",
+    "content_index_partial",
+    "content_index_zones",
+    "indexed_at",
+    "zone_indexed_at",
+    "warming_zones",
+    "fallback_reason",
+    "grep_fallback_performed",
+    "no_fallback_reason",
+    "unindexed_files_in_scope",
+    "unindexed_files_in_scope_count",
+    "unindexed_files_complete",
+    "unindexed_files_scope_complete",
+    "default_excludes_applied",
+    "include_ignored",
+    "include_hidden",
+    "candidate_count",
+    "candidate_limit",
+    "candidates_complete",
+    "no_results",
+    "suggested_next_query",
+    "warnings",
+    "cancelled",
+];
+
 pub fn schema() -> Value {
     json!({
         "name": "text_search",
         "title": "Search text",
-        "description": "Search file contents with exact literal or regex verification. For large repos, scope paths/includes first, prefer literal queries for Tantivy shortlisting, and inspect search_strategy/fallback_reason/warming_zones.",
+        "description": "Search file contents with exact literal or regex verification. Literal queries use Tantivy only for shortlisting and grep for correctness. Inspect search_strategy, fallback_reason, zone age, and unindexed-file diagnostics.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -114,13 +155,17 @@ pub fn schema() -> Value {
                 "mode": { "type": "string", "enum": ["literal", "regex"], "description": "Search mode. Defaults to literal. Literal queries can use Tantivy to shortlist files before exact grep verification; regex always needs grep verification and should be scoped narrowly." },
                 "case_mode": { "type": "string", "enum": ["insensitive", "sensitive", "smart"], "description": "Case handling. smart is case-insensitive unless the query contains uppercase. If case_sensitive is provided, it overrides case_mode for backward compatibility." },
                 "case_sensitive": { "type": "boolean", "description": "Legacy override for case matching. When set, true forces sensitive and false forces insensitive, taking precedence over case_mode." },
-                "max_results": { "type": "integer", "description": "Maximum matches to return. Defaults to 100; 0 returns no matches." },
+                "max_results": { "type": "integer", "minimum": 0, "maximum": 1000, "description": "Maximum matches to return. Defaults to 100; 0 returns no matches." },
                 "includes": { "type": "array", "items": { "type": "string" }, "description": "Glob include filters relative to searched roots, e.g. **/*.rs." },
-                "excludes": { "type": "array", "items": { "type": "string" }, "description": "Glob exclude filters relative to searched roots. Expensive grep fallback also applies default excludes for build/generated/vendor directories unless the user directly scopes into them." },
-                "context_lines": { "type": "integer", "description": "Number of before/after context lines per match. Values are capped at 10." },
-                "max_line_length": { "type": "integer", "description": "Maximum displayed characters per matched line before truncation." },
+                "excludes": { "type": "array", "items": { "type": "string" }, "description": "Glob exclude filters relative to searched roots. Grep fallback also applies shared generated/vendor excludes (including build, dist, obj, out, target, node_modules, vendor, and third_party) unless the user directly scopes into them. bin is excluded only for recognized .NET/Java workspaces; default_excludes_applied reports this." },
+                "context_lines": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Number of before/after context lines per match, returned as context_before/context_after. Maximum 10." },
+                "max_line_length": { "type": "integer", "minimum": 1, "maximum": 4000, "description": "Maximum displayed characters per matched line before ellipsis markers. Defaults to 240." },
                 "explain_no_results": { "type": "boolean", "description": "When true, include diagnostics explaining why no matches were found, including fallback/index context." },
+                "include_ignored": { "type": "boolean", "description": "Include files ignored by .gitignore, .git/info/exclude, global gitignore, or .ignore files during grep fallback." },
+                "include_hidden": { "type": "boolean", "description": "Include hidden files and directories except VCS metadata directories such as .git, unless scoped directly." },
                 "allow_expensive_fallback": { "type": "boolean", "description": "Set true to permit root-wide grep fallback in very large indexed workspaces. Default false protects agents from Chromium-scale timeouts; prefer scoping paths first." }
+                ,"output_format": { "type": "string", "enum": ["json", "markdown", "compact"], "description": "Output shape. All formats group detailed diagnostics only when results are incomplete, explicitly requested, or verbose." }
+                ,"verbose": { "type": "boolean", "description": "Include detailed search and index diagnostics even when the result is complete. Defaults to false." }
             },
             "required": ["query"]
         }
@@ -146,6 +191,7 @@ pub fn search_telemetry() -> Value {
 fn execute_blocking(args: Value) -> Result<Value> {
     let started_at = Instant::now();
     TOTAL_TEXT_SEARCHES.fetch_add(1, Ordering::Relaxed);
+    let cancellation = crate::cancellation::token_from_args(&args);
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -154,17 +200,41 @@ fn execute_blocking(args: Value) -> Result<Value> {
     if query.is_empty() {
         return Err(anyhow::anyhow!("Query cannot be empty"));
     }
+    let output_format = parse_output_format(args.get("output_format"), true)?;
+    let verbose = args
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Ok(format_text_search_response(
+            cancelled_search_response(started_at),
+            output_format,
+            verbose,
+        ));
+    }
 
-    let input_paths: Vec<PathBuf> = args
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| p.as_str())
-                .map(crate::common::resolve_tool_path)
-                .collect()
-        })
-        .unwrap_or_else(|| vec![crate::common::default_tool_root()]);
+    let input_paths: Vec<PathBuf> =
+        if let Some(paths) = args.get("paths").and_then(|v| v.as_array()) {
+            paths
+                .iter()
+                .filter_map(|path| path.as_str())
+                .map(crate::common::resolve_existing_tool_path)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![crate::common::default_tool_root()]
+        };
+    let display_root = crate::common::common_path_root(&input_paths);
+    if let Some(cancellation) = cancellation.as_ref() {
+        let workspace_root = input_paths
+            .first()
+            .and_then(|path| crate::common::discover_workspace_root(path))
+            .or_else(|| crate::workspace_control::active_workspace().map(|(root, _)| root))
+            .map(|root| crate::common::normalize_display_path(&root));
+        cancellation.report_progress(0, workspace_root.as_deref());
+    }
 
     let mode = parse_mode(args.get("mode").and_then(|v| v.as_str()))?;
     let case_mode = parse_case_mode(
@@ -188,7 +258,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
         &args,
         "max_line_length",
         DEFAULT_MAX_LINE_LENGTH,
-        40,
+        1,
         MAX_LINE_LENGTH,
     );
     let explain_no_results = args
@@ -198,6 +268,18 @@ fn execute_blocking(args: Value) -> Result<Value> {
     let allow_expensive_fallback = args
         .get("allow_expensive_fallback")
         .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_ignored = args
+        .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_hidden = args
+        .get("include_hidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let suppress_filter_hints = args
+        .get("_suppress_filter_hints")
+        .and_then(Value::as_bool)
         .unwrap_or(false);
 
     let include_globs = parse_pattern_strings(args.get("includes"));
@@ -217,7 +299,10 @@ fn execute_blocking(args: Value) -> Result<Value> {
     let includes_applied = !includes.is_empty();
     let excludes_applied = !excludes.is_empty();
     let default_excludes_applied = !default_exclude_globs.is_empty();
-    let shared = Arc::new(SharedSearchState::default());
+    let shared = Arc::new(SharedSearchState {
+        cancellation,
+        ..Default::default()
+    });
     let mut stats = SearchStats {
         paths_received: input_paths.len(),
         ..Default::default()
@@ -227,14 +312,24 @@ fn execute_blocking(args: Value) -> Result<Value> {
     let mut content_index_partial = false;
     let mut content_index_zones = Vec::<String>::new();
     let mut warming_zones = Vec::<String>::new();
+    let mut zone_indexed_at = Vec::new();
+    let mut index_age_secs = None;
     let mut fallback_reasons = Vec::<String>::new();
     let mut candidate_count = 0usize;
     let mut candidate_limit = 0usize;
     let mut candidates_truncated = false;
-    let mut run_grep_fallback = true;
+    let run_grep_fallback = max_results > 0;
+    let mut grep_fallback_performed = false;
+    let mut no_fallback_reason = None::<String>;
     let mut index_candidates_searched = false;
 
-    if mode == SearchMode::Literal && max_results > 0 {
+    if include_ignored {
+        fallback_reasons.push("include_ignored_requires_filesystem".to_string());
+    }
+    if include_hidden {
+        fallback_reasons.push("include_hidden_requires_filesystem".to_string());
+    }
+    if !include_ignored && !include_hidden && mode == SearchMode::Literal && max_results > 0 {
         let requested_candidate_limit = max_results.saturating_mul(64).max(256);
         let index_result =
             query_tantivy_content_candidates(&input_paths, query, requested_candidate_limit);
@@ -246,6 +341,8 @@ fn execute_blocking(args: Value) -> Result<Value> {
         candidate_count = index_result.candidate_count;
         candidate_limit = index_result.candidate_limit;
         candidates_truncated = index_result.candidates_truncated;
+        zone_indexed_at = index_result.zone_indexed_at;
+        index_age_secs = index_result.index_age_secs;
 
         if content_index_used {
             let matcher = build_matcher(&pattern, case_sensitive_effective)
@@ -264,10 +361,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
                 &mut stats,
             );
 
-            if !content_index_partial {
-                run_grep_fallback = false;
-                search_strategy = "tantivy";
-            }
+            fallback_reasons.push("literal_verification_requires_grep".to_string());
         }
     } else if mode == SearchMode::Regex {
         fallback_reasons.push("regex_mode_requires_grep".to_string());
@@ -285,12 +379,18 @@ fn execute_blocking(args: Value) -> Result<Value> {
             TOTAL_REFUSED_LARGE_SCOPE.fetch_add(1, Ordering::Relaxed);
             if let Some(reason) = fallback_plan.reason {
                 fallback_reasons.push(reason.to_string());
+                no_fallback_reason = Some(reason.to_string());
             }
             record_input_path_validity(&input_paths, &mut stats);
         } else {
+            grep_fallback_performed = true;
             TOTAL_GREP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             let dedup_fallback_candidates = index_candidates_searched || input_paths.len() > 1;
             for input_path in &input_paths {
+                if shared.cancellation_requested() {
+                    shared.stop.store(true, Ordering::Relaxed);
+                    break;
+                }
                 process_input_path(
                     input_path,
                     &include_globs,
@@ -303,20 +403,33 @@ fn execute_blocking(args: Value) -> Result<Value> {
                     search_collection_limit(max_results),
                     max_line_length,
                     dedup_fallback_candidates,
+                    include_ignored,
+                    include_hidden,
                     Arc::clone(&shared),
                     &mut stats,
                 )?;
             }
         }
     } else {
+        no_fallback_reason = Some("max_results_zero".to_string());
         record_input_path_validity(&input_paths, &mut stats);
     }
     fallback_reasons.sort();
     fallback_reasons.dedup();
 
     let search_errors = shared.search_errors.load(Ordering::Relaxed);
+    let unindexed_files_count = shared.unindexed_files_count.load(Ordering::Relaxed);
+    let mut unindexed_files_in_scope = shared
+        .unindexed_files
+        .lock()
+        .map_err(|_| anyhow::anyhow!("text_search unindexed-file collector is unavailable"))?
+        .clone();
+    relativize_display_paths(&mut unindexed_files_in_scope, display_root.as_deref());
+    let unindexed_files_truncated = unindexed_files_count > unindexed_files_in_scope.len();
+    let unindexed_files_scope_complete = grep_fallback_performed && search_errors == 0;
     let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     LAST_SEARCH_DURATION_MS.store(duration_ms, Ordering::Relaxed);
+    let cancelled = shared.cancellation_requested();
     let mut matches = match Arc::try_unwrap(shared) {
         Ok(state) => state
             .matches
@@ -328,6 +441,9 @@ fn execute_blocking(args: Value) -> Result<Value> {
             .map_err(|_| anyhow::anyhow!("text_search result collector is unavailable"))?
             .clone(),
     };
+    for search_match in &mut matches {
+        search_match.file = relative_display_path(&search_match.file, display_root.as_deref());
+    }
     matches.sort_by(|left, right| {
         left.file
             .cmp(&right.file)
@@ -337,9 +453,16 @@ fn execute_blocking(args: Value) -> Result<Value> {
 
     let total_returned = matches.len();
     let limit_reached = max_results > 0 && total_returned >= max_results;
+    let complete = !limit_reached
+        && stats.files_skipped_large == 0
+        && search_errors == 0
+        && !cancelled
+        && search_strategy != "refused_large_scope"
+        && (!content_index_partial || grep_fallback_performed);
     let no_results = if explain_no_results && total_returned == 0 {
         Some(json!({
             "reason": no_results_reason(&stats),
+            "mode": mode,
             "paths_received": stats.paths_received,
             "valid_paths": stats.valid_paths,
             "invalid_paths": stats.invalid_paths,
@@ -349,6 +472,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
             "includes_applied": includes_applied,
             "excludes_applied": excludes_applied,
             "default_excludes_applied": default_excludes_applied,
+            "default_excludes": default_exclude_globs,
             "fallback_reason": fallback_reasons
         }))
     } else {
@@ -356,8 +480,10 @@ fn execute_blocking(args: Value) -> Result<Value> {
     };
 
     let mut response = json!({
+        "root": display_root.as_deref().map(normalize_path),
         "matches": matches,
         "total_returned": total_returned,
+        "complete": complete,
         "limit_reached": limit_reached,
         "limit_reason": if limit_reached { Some("max_results") } else { None },
         "files_considered": stats.files_considered,
@@ -365,36 +491,290 @@ fn execute_blocking(args: Value) -> Result<Value> {
         "files_skipped_large": stats.files_skipped_large,
         "search_errors": search_errors,
         "duration_ms": duration_ms,
-        "mode": mode,
         "case_mode": case_mode,
-        "max_line_length": max_line_length,
-        "engine": engine_for_strategy(search_strategy),
         "search_strategy": search_strategy,
-        "candidate_engine": if candidate_limit > 0 { Some("tantivy") } else { None },
-        "verification_engine": "grep_searcher",
         "content_index_used": content_index_used,
         "content_index_partial": content_index_partial,
+        "index_used": content_index_used,
+        "index_complete": !content_index_partial,
         "content_index_zones": content_index_zones,
+        "indexed_at": zone_indexed_at,
+        "zone_indexed_at": zone_indexed_at,
+        "index_age_secs": index_age_secs,
         "warming_zones": warming_zones,
         "fallback_reason": fallback_reasons,
-        "candidate_count": candidate_count,
-        "candidate_limit": candidate_limit,
-        "candidates_truncated": candidates_truncated,
+        "grep_fallback_performed": grep_fallback_performed,
+        "no_fallback_reason": no_fallback_reason,
+        "unindexed_files_in_scope": unindexed_files_in_scope,
+        "unindexed_files_in_scope_count": unindexed_files_count,
+        "unindexed_files_complete": !unindexed_files_truncated,
+        "unindexed_files_scope_complete": unindexed_files_scope_complete,
         "default_excludes_applied": default_excludes_applied,
-        "default_excludes": default_exclude_globs,
-        "allow_expensive_fallback": allow_expensive_fallback,
-        "suggested_next_query": suggested_next_query(&input_paths, search_strategy)
+        "include_ignored": include_ignored,
+        "include_hidden": include_hidden
     });
 
+    // Candidate stats only mean something when the content index was queried.
+    if candidate_limit > 0 {
+        insert_object_field(&mut response, "candidate_count", json!(candidate_count));
+        insert_object_field(&mut response, "candidate_limit", json!(candidate_limit));
+        insert_object_field(
+            &mut response,
+            "candidates_complete",
+            json!(!candidates_truncated),
+        );
+    }
     if let Some(no_results) = no_results {
         insert_object_field(&mut response, "no_results", no_results);
     }
-    let warnings = search_scope_warnings(&input_paths, search_strategy);
+    if let Some(suggestion) = suggested_next_query(&input_paths, search_strategy) {
+        insert_object_field(&mut response, "suggested_next_query", json!(suggestion));
+    }
+    let mut warnings = search_scope_warnings(&input_paths, search_strategy);
+    if max_results > 0 && total_returned == 0 && !suppress_filter_hints {
+        warnings.extend(filtered_scope_warnings(
+            &input_paths,
+            include_ignored,
+            include_hidden,
+        ));
+        warnings.sort();
+        warnings.dedup();
+    }
     if !warnings.is_empty() {
         insert_object_field(&mut response, "warnings", json!(warnings));
     }
+    if cancelled {
+        insert_object_field(&mut response, "cancelled", json!(true));
+    }
 
-    Ok(response)
+    Ok(format_text_search_response(
+        response,
+        output_format,
+        verbose,
+    ))
+}
+
+fn cancelled_search_response(started_at: Instant) -> Value {
+    json!({
+        "root": Value::Null,
+        "matches": [],
+        "total_returned": 0,
+        "complete": false,
+        "limit_reached": false,
+        "files_considered": 0,
+        "files_searched": 0,
+        "search_errors": 0,
+        "duration_ms": started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        "cancelled": true
+    })
+}
+
+fn format_text_search_response(
+    response: Value,
+    output_format: OutputFormat,
+    verbose: bool,
+) -> Value {
+    match output_format {
+        OutputFormat::Json => {
+            let include_diagnostics = should_render_diagnostics(&response, verbose);
+            let diagnostic_fields =
+                if response.get("total_returned").and_then(Value::as_u64) == Some(0) {
+                    &DIAGNOSTIC_FIELDS[1..]
+                } else {
+                    DIAGNOSTIC_FIELDS
+                };
+            super::nest_diagnostics(response, diagnostic_fields, include_diagnostics)
+        }
+        OutputFormat::Markdown => {
+            json!({ "__mcp_raw_text": render_markdown_report(&response, verbose) })
+        }
+        OutputFormat::Compact => {
+            json!({ "__mcp_raw_text": render_compact_report(&response, verbose) })
+        }
+    }
+}
+
+fn render_compact_report(response: &Value, verbose: bool) -> String {
+    let mut lines = vec![
+        format!(
+            "root: {}",
+            response.get("root").and_then(Value::as_str).unwrap_or(".")
+        ),
+        format!(
+            "total_returned: {}",
+            response
+                .get("total_returned")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "complete: {}",
+            response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ),
+    ];
+    if response.get("total_returned").and_then(Value::as_u64) == Some(0) {
+        lines.insert(
+            2,
+            format!(
+                "files_searched: {}",
+                response
+                    .get("files_searched")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ),
+        );
+    }
+    push_compact_matches(&mut lines, response.get("matches"));
+    if should_render_diagnostics(response, verbose) {
+        lines.push(format!(
+            "diagnostics: {}",
+            serde_json::to_string(&search_diagnostics(response)).unwrap_or_default()
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_markdown_report(response: &Value, verbose: bool) -> String {
+    let mut lines = vec![
+        "# Text Search".to_string(),
+        String::new(),
+        format!(
+            "- Root: `{}`",
+            response.get("root").and_then(Value::as_str).unwrap_or(".")
+        ),
+        format!(
+            "- Matches: {}",
+            response
+                .get("total_returned")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "- Complete: {}",
+            response
+                .get("complete")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        ),
+    ];
+    if response.get("total_returned").and_then(Value::as_u64) == Some(0) {
+        lines.insert(
+            4,
+            format!(
+                "- Files searched: {}",
+                response
+                    .get("files_searched")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ),
+        );
+    }
+    push_markdown_matches(&mut lines, response.get("matches"));
+    if should_render_diagnostics(response, verbose) {
+        lines.extend([
+            String::new(),
+            "## Diagnostics".to_string(),
+            String::new(),
+            "```json".to_string(),
+            serde_json::to_string(&search_diagnostics(response)).unwrap_or_default(),
+            "```".to_string(),
+        ]);
+    }
+    lines.join("\n")
+}
+
+fn push_compact_matches(lines: &mut Vec<String>, matches: Option<&Value>) {
+    let mut current_file = None::<&str>;
+    for item in matches.and_then(Value::as_array).into_iter().flatten() {
+        let file = item.get("file").and_then(Value::as_str).unwrap_or("");
+        if current_file != Some(file) {
+            lines.push(format!("file: {}", file));
+            current_file = Some(file);
+        }
+        lines.push(format_match_summary(item, false));
+    }
+}
+
+fn push_markdown_matches(lines: &mut Vec<String>, matches: Option<&Value>) {
+    let mut current_file = None::<&str>;
+    for item in matches.and_then(Value::as_array).into_iter().flatten() {
+        let file = item.get("file").and_then(Value::as_str).unwrap_or("");
+        if current_file != Some(file) {
+            lines.extend([String::new(), format!("## `{}`", file.replace('`', "\\`"))]);
+            current_file = Some(file);
+        }
+        lines.push(format_match_summary(item, true));
+    }
+}
+
+fn format_match_summary(item: &Value, markdown: bool) -> String {
+    let line = item.get("line").and_then(Value::as_u64).unwrap_or(0);
+    let column = item
+        .get("match_column")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let text = item
+        .get("line_text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .replace(['\r', '\n'], " ");
+    if markdown {
+        format!("- `{}:{}` {}", line, column, text)
+    } else {
+        format!("{}:{}: {}", line, column, text)
+    }
+}
+
+fn should_render_diagnostics(response: &Value, verbose: bool) -> bool {
+    verbose
+        || !response
+            .get("complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || response.get("no_results").is_some()
+        || response
+            .get("warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| !warnings.is_empty())
+}
+
+fn search_diagnostics(response: &Value) -> Value {
+    let keys = [
+        "limit_reached",
+        "limit_reason",
+        "search_strategy",
+        "index_used",
+        "index_complete",
+        "index_age_secs",
+    ];
+    let mut diagnostics = serde_json::Map::new();
+    for key in keys.into_iter().chain(DIAGNOSTIC_FIELDS.iter().copied()) {
+        if key == "files_searched"
+            && response.get("total_returned").and_then(Value::as_u64) == Some(0)
+        {
+            continue;
+        }
+        if let Some(value) = response.get(key)
+            && !value.is_null()
+            && !matches!(value, Value::Array(items) if items.is_empty())
+        {
+            diagnostics.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(diagnostics)
+}
+
+fn relativize_display_paths(paths: &mut [String], root: Option<&Path>) {
+    for path in paths {
+        *path = relative_display_path(path, root);
+    }
+}
+
+fn relative_display_path(path: &str, root: Option<&Path>) -> String {
+    crate::common::display_path_relative_to(Path::new(path), root)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -476,11 +856,17 @@ fn process_input_path(
     max_results: usize,
     max_line_length: usize,
     dedup_candidates: bool,
+    include_ignored: bool,
+    include_hidden: bool,
     shared: Arc<SharedSearchState>,
     stats: &mut SearchStats,
 ) -> Result<()> {
     if !input_path.exists() {
         stats.invalid_paths.push(normalize_path(input_path));
+        return Ok(());
+    }
+    if shared.cancellation_requested() {
+        shared.stop.store(true, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -523,12 +909,8 @@ fn process_input_path(
     stats.valid_paths += 1;
 
     let mut walk = WalkBuilder::new(&canonical_path);
-    walk.hidden(true)
-        .ignore(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .threads(crate::common::bounded_walk_threads());
+    configure_walk_filters(&mut walk, include_ignored, include_hidden);
+    walk.threads(crate::common::bounded_walk_threads());
     // Includes are enforced by `passes_patterns` below. Applying them as
     // ignore overrides makes `includes: ["src"]` match only the directory
     // itself and silently drop descendants such as `src/lib.rs`.
@@ -538,6 +920,13 @@ fn process_input_path(
     walk.filter_entry(move |entry| {
         if entry.path() == filter_root {
             return true;
+        }
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+            && is_vcs_metadata_dir(entry.path(), &filter_root)
+        {
+            return false;
         }
         if !entry
             .file_type()
@@ -569,6 +958,10 @@ fn process_input_path(
         let mut searcher = build_searcher(context_lines);
 
         Box::new(move |entry| {
+            if shared.cancellation_requested() {
+                shared.stop.store(true, Ordering::Relaxed);
+                return WalkState::Quit;
+            }
             let Some(matcher) = matcher.as_ref() else {
                 shared.search_errors.fetch_add(1, Ordering::Relaxed);
                 shared.stop.store(true, Ordering::Relaxed);
@@ -638,7 +1031,10 @@ fn search_candidate(
     dedup_candidates: bool,
     shared: &SharedSearchState,
 ) {
-    if max_results == 0 || shared.stop.load(Ordering::Relaxed) {
+    if max_results == 0 || shared.stop.load(Ordering::Relaxed) || shared.cancellation_requested() {
+        if shared.cancellation_requested() {
+            shared.stop.store(true, Ordering::Relaxed);
+        }
         return;
     }
 
@@ -659,48 +1055,43 @@ fn search_candidate(
         }
     }
 
-    shared.files_considered.fetch_add(1, Ordering::Relaxed);
+    record_unindexed_file(&candidate.path, shared);
 
-    let meta = match candidate.path.metadata() {
-        Ok(meta) => meta,
-        Err(_) => {
-            shared.search_errors.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    };
+    let files_considered = shared
+        .files_considered
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if files_considered.is_multiple_of(64)
+        && let Some(cancellation) = shared.cancellation.as_ref()
+    {
+        cancellation.report_progress(files_considered, None);
+    }
 
-    if meta.len() > MAX_SEARCH_FILE_BYTES {
-        shared.files_skipped_large.fetch_add(1, Ordering::Relaxed);
+    if candidate.path.metadata().is_err() {
+        shared.search_errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
     shared.files_searched.fetch_add(1, Ordering::Relaxed);
-    let mut local_matches = Vec::new();
     let candidate_path = candidate.path.clone();
     let display_path = normalize_path(&candidate_path);
 
-    let search_result = searcher.search_path(
+    let mut sink = MatchSink::new(
         matcher,
-        &candidate_path,
-        UTF8(|line_num, line| {
-            let raw_line = line.trim_end_matches(['\r', '\n']);
-            let (line_text, line_truncated) = truncate_text(raw_line, max_line_length);
-            local_matches.push(SearchMatch {
-                file: display_path.clone(),
-                line: line_num,
-                snippet: line_text.trim().to_string(),
-                line_text,
-                line_truncated,
-            });
-
-            Ok(local_matches.len() < max_results)
-        }),
+        max_results,
+        max_line_length,
+        searcher.before_context(),
+        searcher.after_context(),
+        shared.cancellation.clone(),
     );
-
-    if search_result.is_err() {
+    if searcher
+        .search_path(matcher, &candidate_path, &mut sink)
+        .is_err()
+    {
         shared.search_errors.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    let local_matches = sink.into_matches(&display_path);
 
     if local_matches.is_empty() {
         return;
@@ -719,6 +1110,154 @@ fn search_candidate(
             break;
         }
         matches.push(search_match);
+    }
+}
+
+fn record_unindexed_file(path: &Path, shared: &SharedSearchState) {
+    if content_policy_allows_path(path) {
+        return;
+    }
+    let Ok(mut seen) = shared.unindexed_seen.lock() else {
+        shared.search_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if !seen.insert(path.to_path_buf()) {
+        return;
+    }
+    shared.unindexed_files_count.fetch_add(1, Ordering::Relaxed);
+    let Ok(mut files) = shared.unindexed_files.lock() else {
+        shared.search_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if files.len() < MAX_UNINDEXED_FILES_REPORTED {
+        files.push(crate::common::normalize_display_path(path));
+    }
+}
+
+/// Collects matching lines together with the before/after context lines the
+/// searcher reports. The `sinks::UTF8` convenience sink only receives matches,
+/// so `context_lines` was silently ignored when it was used.
+struct MatchSink<'matcher> {
+    matcher: &'matcher RegexMatcher,
+    max_results: usize,
+    max_line_length: usize,
+    before_context: usize,
+    after_context: usize,
+    matches: Vec<(u64, String, bool, usize)>,
+    lines: BTreeMap<u64, String>,
+    limit_reached: bool,
+    trailing_after_lines: usize,
+    cancellation: Option<CancellationToken>,
+}
+
+impl<'matcher> MatchSink<'matcher> {
+    fn new(
+        matcher: &'matcher RegexMatcher,
+        max_results: usize,
+        max_line_length: usize,
+        before_context: usize,
+        after_context: usize,
+        cancellation: Option<CancellationToken>,
+    ) -> Self {
+        Self {
+            matcher,
+            max_results,
+            max_line_length,
+            before_context,
+            after_context,
+            matches: Vec::new(),
+            lines: BTreeMap::new(),
+            limit_reached: false,
+            trailing_after_lines: 0,
+            cancellation,
+        }
+    }
+
+    fn into_matches(self, file: &str) -> Vec<SearchMatch> {
+        let context = |range: std::ops::RangeInclusive<u64>| -> Vec<String> {
+            range
+                .filter_map(|line| self.lines.get(&line).cloned())
+                .collect()
+        };
+        self.matches
+            .iter()
+            .map(
+                |(line, line_text, line_truncated, match_column)| SearchMatch {
+                    file: file.to_string(),
+                    line: *line,
+                    line_text: line_text.clone(),
+                    match_column: *match_column,
+                    line_truncated: *line_truncated,
+                    context_before: if self.before_context == 0 {
+                        Vec::new()
+                    } else {
+                        let first = line.saturating_sub(self.before_context as u64).max(1);
+                        context(first..=line.saturating_sub(1))
+                    },
+                    context_after: if self.after_context == 0 {
+                        Vec::new()
+                    } else {
+                        context(line + 1..=line + self.after_context as u64)
+                    },
+                },
+            )
+            .collect()
+    }
+}
+
+impl Sink for MatchSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Ok(false);
+        }
+        if self.limit_reached {
+            return Ok(false);
+        }
+        let line = mat.line_number().unwrap_or(0);
+        let Some(rendered) = render_match_line(self.matcher, mat.bytes(), self.max_line_length)?
+        else {
+            return Ok(true);
+        };
+        let line_text = rendered.text;
+        let line_truncated = rendered.line_truncated;
+        self.lines.insert(line, line_text.clone());
+        self.matches
+            .push((line, line_text, line_truncated, rendered.match_column));
+        if self.matches.len() >= self.max_results {
+            self.limit_reached = true;
+            // Keep reading only to collect the last match's after-context.
+            return Ok(self.after_context > 0);
+        }
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        context: &SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Ok(false);
+        }
+        if let Some(line) = context.line_number() {
+            let (text, _) = render_line_start(context.bytes(), self.max_line_length);
+            self.lines.insert(line, text);
+        }
+        if self.limit_reached && *context.kind() == SinkContextKind::After {
+            self.trailing_after_lines += 1;
+            return Ok(self.trailing_after_lines < self.after_context);
+        }
+        Ok(true)
     }
 }
 
@@ -789,63 +1328,16 @@ fn parse_usize_arg(args: &Value, name: &str, default: usize, min: usize, max: us
 }
 
 fn passes_patterns(candidate: &CandidateFile, includes: &[Pattern], excludes: &[Pattern]) -> bool {
-    let candidates = candidate_match_strings(candidate);
-
-    if !includes.is_empty() && !matches_any_pattern(&candidates, includes) {
-        return false;
-    }
-
-    if !excludes.is_empty() && matches_any_pattern(&candidates, excludes) {
-        return false;
-    }
-
-    true
+    path_passes_patterns(
+        &candidate.path,
+        &candidate.relative_path,
+        includes,
+        excludes,
+    )
 }
 
 fn matches_excludes(candidate: &CandidateFile, excludes: &[Pattern]) -> bool {
-    !excludes.is_empty() && matches_any_pattern(&candidate_match_strings(candidate), excludes)
-}
-
-fn candidate_match_strings(candidate: &CandidateFile) -> Vec<String> {
-    let full_path = normalize_match_value(&normalize_path(&candidate.path));
-    let file_name = candidate
-        .path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string();
-
-    let mut values = vec![normalize_match_value(&candidate.relative_path), full_path];
-    if !file_name.is_empty() {
-        values.push(normalize_match_value(&file_name));
-    }
-    values
-}
-
-fn matches_any_pattern(values: &[String], patterns: &[Pattern]) -> bool {
-    patterns.iter().any(|pattern| {
-        let pattern_value = normalize_match_value(pattern.as_str());
-        values.iter().any(|value| {
-            pattern.matches(value)
-                || value == &pattern_value
-                || value.starts_with(&(pattern_value.clone() + "/"))
-                || value
-                    .split('/')
-                    .any(|segment| segment == pattern_value.as_str())
-        })
-    })
-}
-
-fn normalize_match_value(value: &str) -> String {
-    let normalized = value.replace('\\', "/");
-    #[cfg(windows)]
-    {
-        normalized.to_ascii_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
-        normalized
-    }
+    matches_patterns_or_ancestors(&candidate.path, &candidate.relative_path, excludes)
 }
 
 fn no_results_reason(stats: &SearchStats) -> &'static str {
@@ -884,7 +1376,11 @@ fn search_scope_warnings(input_paths: &[PathBuf], search_strategy: &str) -> Vec<
         else {
             continue;
         };
-        if indexed_root == canonical_path {
+        if indexed_root == canonical_path
+            && indexed_file_count_is_large(crate::indexer::indexed_workspace_file_count(
+                &indexed_root,
+            ))
+        {
             warnings.push(format!(
                 "Search used {} at indexed workspace root '{}'. For large repos, retry with a narrower paths value (for example a component directory), use a literal query when possible, or set allow_expensive_fallback=true only when a full grep scan is intentional.",
                 search_strategy,
@@ -896,15 +1392,6 @@ fn search_scope_warnings(input_paths: &[PathBuf], search_strategy: &str) -> Vec<
     warnings.sort();
     warnings.dedup();
     warnings
-}
-
-fn engine_for_strategy(search_strategy: &str) -> &'static str {
-    match search_strategy {
-        "tantivy" => "tantivy+grep_verify",
-        "mixed" => "tantivy+grep_fallback",
-        "refused_large_scope" => "planner",
-        _ => "grep_searcher/ignore",
-    }
 }
 
 fn plan_grep_fallback(input_paths: &[PathBuf], allow_expensive_fallback: bool) -> FallbackPlan {
@@ -925,7 +1412,11 @@ fn plan_grep_fallback(input_paths: &[PathBuf], allow_expensive_fallback: bool) -
         else {
             continue;
         };
-        if indexed_root == canonical_path {
+        if indexed_root == canonical_path
+            && indexed_file_count_is_large(crate::indexer::indexed_workspace_file_count(
+                &indexed_root,
+            ))
+        {
             return FallbackPlan {
                 allow_grep: false,
                 reason: Some("large_scope_requires_explicit_fallback"),
@@ -939,6 +1430,10 @@ fn plan_grep_fallback(input_paths: &[PathBuf], allow_expensive_fallback: bool) -
     }
 }
 
+fn indexed_file_count_is_large(indexed_files: Option<usize>) -> bool {
+    indexed_files.is_some_and(|count| count > crate::indexer::LARGE_WORKSPACE_FILE_THRESHOLD)
+}
+
 fn default_fallback_excludes(input_paths: &[PathBuf], user_excludes: &[String]) -> Vec<String> {
     if input_paths
         .iter()
@@ -947,21 +1442,10 @@ fn default_fallback_excludes(input_paths: &[PathBuf], user_excludes: &[String]) 
         return Vec::new();
     }
 
-    DEFAULT_FALLBACK_EXCLUDES
-        .iter()
-        .filter(|pattern| !user_excludes.iter().any(|existing| existing == **pattern))
-        .map(|pattern| (*pattern).to_string())
+    default_generated_vendor_globs(input_paths)
+        .into_iter()
+        .filter(|pattern| !user_excludes.iter().any(|existing| existing == pattern))
         .collect()
-}
-
-fn is_direct_vendor_or_generated_scope(path: &Path) -> bool {
-    let normalized = normalize_path(&canonicalize_existing_path(path));
-    normalized.split('/').any(|part| {
-        matches!(
-            part,
-            "third_party" | "out" | "generated" | "node_modules" | "target"
-        )
-    })
 }
 
 fn suggested_next_query(input_paths: &[PathBuf], search_strategy: &str) -> Option<String> {
@@ -998,20 +1482,22 @@ fn relative_path_for_roots(path: &Path, roots: &[PathBuf]) -> String {
         .unwrap_or_else(|| normalize_path(path).to_string())
 }
 
-fn truncate_text(raw: &str, max_chars: usize) -> (String, bool) {
-    if raw.chars().count() <= max_chars {
-        return (raw.to_string(), false);
-    }
-
-    let mut truncated = raw.chars().take(max_chars).collect::<String>();
-    truncated.push_str("...");
-    (truncated, true)
-}
-
 fn canonicalize_existing_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn normalize_path(path: &Path) -> String {
     crate::common::normalize_display_path(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::indexed_file_count_is_large;
+
+    #[test]
+    fn root_grep_is_refused_only_above_large_workspace_threshold() {
+        assert!(!indexed_file_count_is_large(None));
+        assert!(!indexed_file_count_is_large(Some(50_000)));
+        assert!(indexed_file_count_is_large(Some(50_001)));
+    }
 }

@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::Read;
 use std::time::UNIX_EPOCH;
 
+use crate::limits::{BINARY_PROBE_BYTES, FILE_SUMMARY_LINE_COUNT_BYTES};
+
 fn detect_language(ext: &str) -> &'static str {
     match ext {
         "rs" => "Rust",
@@ -87,9 +89,9 @@ pub async fn execute(args: &Value) -> Result<Value> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Read up to 8KB
+    // Read a bounded prefix for encoding, binary, and preview detection.
     let mut file = File::open(&path)?;
-    let mut buffer = vec![0; std::cmp::min(8192, total_size as usize)];
+    let mut buffer = vec![0; std::cmp::min(BINARY_PROBE_BYTES, total_size as usize)];
     let bytes_read = file.read(&mut buffer)?;
     buffer.truncate(bytes_read);
 
@@ -99,9 +101,10 @@ pub async fn execute(args: &Value) -> Result<Value> {
     if is_binary {
         return Ok(json!({
             "path": crate::common::normalize_display_path(&path),
-            "size": total_size,
+            "size_bytes": total_size,
             "language": language,
             "last_modified": last_modified,
+            "bom": crate::tools::read_file::has_text_bom(&buffer),
             "is_binary": true,
             "lines": 0,
             "outline_preview": null,
@@ -109,30 +112,30 @@ pub async fn execute(args: &Value) -> Result<Value> {
         }));
     }
 
-    let (preview_content, encoding) = crate::tools::read_file::decode_fuzzy(&buffer);
+    let (preview_content, encoding, bom) = crate::tools::read_file::decode_for_read(&buffer);
     let preview_lines: Vec<&str> = preview_content.lines().take(10).collect();
     let outline_preview = preview_lines.join("\n");
 
-    let line_count = if total_size > 50 * 1024 * 1024 {
+    let line_count = if total_size > FILE_SUMMARY_LINE_COUNT_BYTES {
         -1
     } else {
-        match std::fs::read(&path) {
-            Ok(full_buf) => {
-                let (full_content, _) = crate::tools::read_file::decode_fuzzy(&full_buf);
-                crate::tools::read_file::count_text_lines(&full_content) as i64
-            }
+        match crate::tools::read_file::inspect_text_file(&path) {
+            Ok(inspection) => inspection.line_count as i64,
             Err(_) => -1,
         }
     };
 
     Ok(json!({
         "path": crate::common::normalize_display_path(&path),
-        "size": total_size,
+        "size_bytes": total_size,
         "language": language,
         "encoding": encoding,
+        "bom": bom,
         "last_modified": last_modified,
         "is_binary": false,
         "lines": line_count,
         "outline_preview": outline_preview,
+        "line_count_limit_bytes": FILE_SUMMARY_LINE_COUNT_BYTES,
+        "line_count_skipped": line_count < 0,
     }))
 }

@@ -26,8 +26,11 @@ pub fn schema() -> Value {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "File path to read. Relative paths resolve against the active workspace." },
-                            "start_line": { "type": "integer", "description": "1-indexed inclusive start line. Defaults to 1." },
+                            "start_line": { "type": "integer", "minimum": 1, "description": "1-indexed inclusive start line. Defaults to 1." },
                             "end_line": { "type": "integer", "description": "1-indexed inclusive end line. Omit to read until max_lines/max_bytes or EOF." },
+                            "tail": { "type": "integer", "minimum": 1, "description": "Read the final N text lines. Mutually exclusive with line ranges and start_byte." },
+                            "start_byte": { "type": "integer", "minimum": 0, "description": "Read a bounded text window from this zero-based raw byte offset." },
+                            "json_pointer": { "type": "string", "description": "Read one JSON branch selected by an RFC 6901 pointer." },
                             "max_lines": { "type": "integer", "description": "Maximum lines for this snippet." },
                             "max_bytes": { "type": "integer", "description": "Maximum UTF-8 output bytes for this snippet. If max_lines and max_bytes are both set, the first reached limit wins." },
                             "include_line_numbers": { "type": "boolean", "description": "Prefix returned lines with 1-indexed line numbers when true. Defaults to false." }
@@ -137,23 +140,45 @@ pub async fn execute(args: &Value) -> Result<Value> {
             _ => {}
         }
 
+        compact_result_defaults(&mut payload);
         results.push(payload);
     }
 
+    let complete = continuations.is_empty() && errored_requests == 0 && skipped_requests == 0;
     Ok(json!({
         "results": results,
+        "result_defaults": {
+            "status": "success",
+            "encoding": "UTF-8",
+            "is_binary": false
+        },
         "total_requests": requests.len(),
         "completed_requests": completed_requests,
         "errored_requests": errored_requests,
         "skipped_requests": skipped_requests,
         "truncated_results": truncated_results,
-        "has_more": !continuations.is_empty(),
+        "complete": complete,
         "continuations": continuations,
         "batch_limits": {
             "max_total_bytes": max_total_bytes,
             "total_content_bytes": total_content_bytes
         }
     }))
+}
+
+fn compact_result_defaults(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if object.get("status").and_then(Value::as_str) == Some("success") {
+        object.remove("status");
+    }
+    if object.get("encoding").and_then(Value::as_str) == Some("UTF-8") {
+        object.remove("encoding");
+    }
+    if object.get("is_binary").and_then(Value::as_bool) == Some(false) {
+        object.remove("is_binary");
+    }
 }
 
 fn remaining_budget(max_total_bytes: Option<usize>, used_bytes: usize) -> Option<usize> {
@@ -204,6 +229,9 @@ fn execute_single_request(request: &Value, request_index: usize) -> Value {
         "path": display_path,
         "start_line": request.get("start_line").cloned().unwrap_or(Value::Null),
         "end_line": request.get("end_line").cloned().unwrap_or(Value::Null),
+        "tail": request.get("tail").cloned().unwrap_or(Value::Null),
+        "start_byte": request.get("start_byte").cloned().unwrap_or(Value::Null),
+        "json_pointer": request.get("json_pointer").cloned().unwrap_or(Value::Null),
         "max_lines": request.get("max_lines").cloned().unwrap_or(Value::Null),
         "max_bytes": request.get("max_bytes").cloned().unwrap_or(Value::Null),
         "include_line_numbers": request.get("include_line_numbers").cloned().unwrap_or(json!(false))
@@ -211,10 +239,11 @@ fn execute_single_request(request: &Value, request_index: usize) -> Value {
 
     match read_file::execute_sync(request) {
         Ok(Value::Object(mut object)) => {
+            // A successful read already reports path/start_line/end_line, so
+            // `requested_range` is only echoed for errors and skips.
             object.insert("path".to_string(), json!(display_path));
             object.insert("status".to_string(), json!("success"));
             object.insert("request_index".to_string(), json!(request_index));
-            object.insert("requested_range".to_string(), requested_range);
             Value::Object(object)
         }
         Ok(other) => {
@@ -226,13 +255,20 @@ fn execute_single_request(request: &Value, request_index: usize) -> Value {
                 "requested_range": requested_range
             })
         }
-        Err(err) => json!({
-            "path": display_path,
-            "status": "error",
-            "request_index": request_index,
-            "requested_range": requested_range,
-            "error": err.to_string()
-        }),
+        Err(err) => {
+            let structured = super::structured_tool_error(&err.to_string());
+            let error = structured
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| json!({ "code": "tool_error", "message": err.to_string() }));
+            json!({
+                "path": display_path,
+                "status": "error",
+                "request_index": request_index,
+                "requested_range": requested_range,
+                "error": error
+            })
+        }
     }
 }
 
@@ -250,7 +286,11 @@ fn build_truncation_continuation(
         return None;
     }
 
-    let next_start_line = payload.get("next_start_line").and_then(|v| v.as_u64())?;
+    let next_start_line = payload.get("next_start_line").and_then(|v| v.as_u64());
+    let next_start_byte = payload.get("next_start_byte").and_then(|v| v.as_u64());
+    if next_start_line.is_none() && next_start_byte.is_none() {
+        return None;
+    }
     let remaining_lines = payload
         .get("omitted_lines")
         .and_then(|v| v.as_u64())
@@ -259,13 +299,26 @@ fn build_truncation_continuation(
     let mut suggested_request = original_request.clone();
     let display_path = display_path(path);
     insert_object_field(&mut suggested_request, "path", json!(display_path));
-    insert_object_field(&mut suggested_request, "start_line", json!(next_start_line));
+    if let Some(object) = suggested_request.as_object_mut() {
+        object.remove("tail");
+        if let Some(next_start_byte) = next_start_byte {
+            object.remove("start_line");
+            object.remove("end_line");
+            object.remove("max_lines");
+            object.remove("include_line_numbers");
+            object.insert("start_byte".to_string(), json!(next_start_byte));
+        } else if let Some(next_start_line) = next_start_line {
+            object.remove("start_byte");
+            object.insert("start_line".to_string(), json!(next_start_line));
+        }
+    }
 
     Some(json!({
         "request_index": request_index,
         "path": display_path,
         "reason": "snippet_truncated",
         "next_start_line": next_start_line,
+        "next_start_byte": next_start_byte,
         "remaining_lines": remaining_lines,
         "suggested_request": suggested_request
     }))
@@ -282,6 +335,9 @@ fn skipped_result(request_index: usize, path: &str, request: &Value, reason: &st
             "path": display_path,
             "start_line": request.get("start_line").cloned().unwrap_or(Value::Null),
             "end_line": request.get("end_line").cloned().unwrap_or(Value::Null),
+            "tail": request.get("tail").cloned().unwrap_or(Value::Null),
+            "start_byte": request.get("start_byte").cloned().unwrap_or(Value::Null),
+            "json_pointer": request.get("json_pointer").cloned().unwrap_or(Value::Null),
             "max_lines": request.get("max_lines").cloned().unwrap_or(Value::Null),
             "max_bytes": request.get("max_bytes").cloned().unwrap_or(Value::Null),
             "include_line_numbers": request.get("include_line_numbers").cloned().unwrap_or(json!(false))

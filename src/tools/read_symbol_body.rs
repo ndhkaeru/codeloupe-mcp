@@ -6,13 +6,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tokio::task;
 
+use crate::limits::MAX_IN_MEMORY_TEXT_FILE_BYTES;
 use crate::tools::ast_support::{
-    DEFAULT_AST_FILE_SIZE_LIMIT, detect_language, find_named_symbol_node, parse_language_filter,
+    DEFAULT_AST_FILE_SIZE_LIMIT, detect_language, find_symbol_candidates, parse_language_filter,
     parse_supported_file, visit_candidate_code_files,
 };
 use crate::tools::read_file::decode_fuzzy;
 
-const READ_FILE_SIZE_LIMIT: u64 = 10 * 1024 * 1024;
+const READ_FILE_SIZE_LIMIT: u64 = MAX_IN_MEMORY_TEXT_FILE_BYTES;
 const HEURISTIC_WINDOW_LINES: usize = 80;
 
 pub fn schema() -> Value {
@@ -27,7 +28,8 @@ pub fn schema() -> Value {
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Search roots or files for symbol resolution. Defaults to the active workspace. Use this to scope large repositories." },
                 "file_hint": { "type": "string", "description": "Preferred file to check first. It narrows and prioritizes resolution but does not replace paths." },
                 "language": { "type": "string", "description": "Optional language filter. Accepted values include rust/rs, python/py, javascript/js/jsx/typescript/ts/tsx, c, cpp/c++, go, java, csharp/c#/cs, php, ruby/rb, swift, objc/objective-c." },
-                "include_signature": { "type": "boolean", "description": "Include the symbol signature/header when true. Defaults to true. AST parsing skips files larger than 2 MB." }
+                "include_signature": { "type": "boolean", "description": "Include the symbol signature/header when true. Defaults to true. AST parsing skips files larger than 2 MB." },
+                "line": { "type": "integer", "minimum": 1, "description": "Optional 1-based declaration line used to select one candidate when names are duplicated." }
             },
             "required": ["symbol"]
         }
@@ -50,34 +52,33 @@ fn execute_blocking(args: Value) -> Result<Value> {
         .get("include_signature")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let line = args
+        .get("line")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    if line == Some(0) {
+        return Err(anyhow::anyhow!("line must be >= 1"));
+    }
     let language_filter = parse_language_filter(args.get("language").and_then(|v| v.as_str()))?;
 
-    let search_paths: Vec<PathBuf> = args
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.as_str())
-                .map(crate::common::resolve_tool_path)
-                .collect()
-        })
-        .unwrap_or_else(|| vec![crate::common::default_tool_root()]);
+    let search_paths: Vec<PathBuf> =
+        if let Some(paths) = args.get("paths").and_then(|v| v.as_array()) {
+            paths
+                .iter()
+                .filter_map(|path| path.as_str())
+                .map(crate::common::resolve_existing_tool_path)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![crate::common::default_tool_root()]
+        };
 
     let file_hint = args
         .get("file_hint")
         .and_then(|v| v.as_str())
-        .map(crate::common::resolve_tool_path);
+        .map(|raw| resolve_file_hint(raw, &search_paths))
+        .transpose()?;
 
-    if let Some(file_hint) = &file_hint
-        && (!file_hint.exists() || !file_hint.is_file())
-    {
-        return Err(anyhow::anyhow!(
-            "file_hint is not a valid file: {}",
-            crate::common::normalize_display_path(file_hint)
-        ));
-    }
-
-    let mut ast_result = None;
+    let mut ast_matches = Vec::new();
     visit_candidate_code_files(
         &search_paths,
         file_hint.as_deref(),
@@ -86,30 +87,58 @@ fn execute_blocking(args: Value) -> Result<Value> {
             if detect_language(candidate).is_none() {
                 return Ok(true);
             }
-            if let Some(ast_match) = try_ast_match(candidate, symbol, include_signature)? {
-                ast_result = Some(json!({
-                    "symbol": symbol,
-                    "file": crate::common::normalize_display_path(candidate),
-                    "start_line": ast_match.start_line,
-                    "end_line": ast_match.end_line,
-                    "content": ast_match.content,
-                    "match_source": "ast",
-                    "confidence": "high"
-                }));
-                return Ok(false);
+            for ast_match in try_ast_matches(candidate, symbol, line, include_signature)? {
+                ast_matches.push(AstSymbolMatch {
+                    path: crate::common::normalize_display_path(candidate),
+                    body: ast_match,
+                });
             }
 
             Ok(true)
         },
     )?;
 
-    if let Some(ast_result) = ast_result {
-        return Ok(ast_result);
+    if let Some(file_hint) = &file_hint {
+        let hinted_file = crate::common::normalize_display_path(file_hint);
+        if ast_matches
+            .iter()
+            .any(|matched| matched.path == hinted_file)
+        {
+            ast_matches.retain(|matched| matched.path == hinted_file);
+        }
+    }
+
+    if ast_matches.len() > 1 {
+        let candidates = ast_matches
+            .iter()
+            .map(ast_candidate_payload)
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "symbol": symbol,
+            "ambiguous": true,
+            "match_source": "ast",
+            "total_candidates": candidates.len(),
+            "candidates": candidates
+        }));
+    }
+
+    if let Some(ast_match) = ast_matches.pop() {
+        return Ok(json!({
+            "symbol": symbol,
+            "qualified_name": ast_match.body.qualified_name,
+            "name": ast_match.body.name,
+            "path": ast_match.path,
+            "start_line": ast_match.body.start_line,
+            "end_line": ast_match.body.end_line,
+            "content": ast_match.body.content,
+            "match_source": "ast",
+            "confidence": "high"
+        }));
     }
 
     let definition_pattern = Regex::new(&format!(
         r"(?i)\b(fn|pub\s+fn|func|def|class|struct|enum|trait|interface|type|function|const|let|var|void|int|bool|auto|static)\s+{}\b",
-        regex::escape(symbol)
+        regex::escape(crate::tools::ast_support::symbol_basename(symbol))
     ))
     .context("Invalid heuristic definition regex")?;
 
@@ -124,7 +153,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
             {
                 heuristic_result = Some(json!({
                     "symbol": symbol,
-                    "file": crate::common::normalize_display_path(candidate),
+                    "path": crate::common::normalize_display_path(candidate),
                     "start_line": heuristic_match.start_line,
                     "end_line": heuristic_match.end_line,
                     "content": heuristic_match.content,
@@ -145,10 +174,69 @@ fn execute_blocking(args: Value) -> Result<Value> {
     Err(anyhow::anyhow!("Could not resolve symbol '{}'", symbol))
 }
 
+fn resolve_file_hint(raw: &str, search_paths: &[PathBuf]) -> Result<PathBuf> {
+    let input = crate::common::path_from_input(raw);
+    let mut candidates = Vec::new();
+
+    if input.is_absolute() {
+        push_file_hint_candidate(&mut candidates, input.clone());
+    } else {
+        for search_path in search_paths {
+            let candidate = if search_path.is_file() {
+                if search_path.ends_with(&input) {
+                    search_path.clone()
+                } else {
+                    continue;
+                }
+            } else {
+                search_path.join(&input)
+            };
+            push_file_hint_candidate(&mut candidates, candidate);
+        }
+
+        if candidates.is_empty() {
+            push_file_hint_candidate(&mut candidates, crate::common::resolve_tool_path(raw));
+        }
+    }
+
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Err(anyhow::anyhow!(
+            "file_hint is not a valid file: {}",
+            crate::common::normalize_display_path(&input)
+        )),
+        _ => Err(anyhow::anyhow!(
+            "file_hint is ambiguous across search paths: {}",
+            candidates
+                .iter()
+                .map(|candidate| crate::common::normalize_display_path(candidate))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn push_file_hint_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    let candidate = crate::common::canonicalize_if_exists(candidate);
+    if !candidate.is_file() || candidates.iter().any(|existing| existing == &candidate) {
+        return;
+    }
+    candidates.push(candidate);
+}
+
 struct SymbolBody {
     content: String,
     start_line: usize,
     end_line: usize,
+    declaration_start_line: usize,
+    declaration_end_line: usize,
+    name: String,
+    qualified_name: String,
+}
+
+struct AstSymbolMatch {
+    path: String,
+    body: SymbolBody,
 }
 
 struct HeuristicBody {
@@ -158,32 +246,52 @@ struct HeuristicBody {
     confidence: &'static str,
 }
 
-fn try_ast_match(path: &Path, symbol: &str, include_signature: bool) -> Result<Option<SymbolBody>> {
+fn try_ast_matches(
+    path: &Path,
+    symbol: &str,
+    line: Option<usize>,
+    include_signature: bool,
+) -> Result<Vec<SymbolBody>> {
     let parsed = match parse_supported_file(path, DEFAULT_AST_FILE_SIZE_LIMIT, None)? {
         Some(parsed) => parsed,
-        None => return Ok(None),
+        None => return Ok(Vec::new()),
     };
 
-    let symbol_node = match find_named_symbol_node(parsed.tree.root_node(), &parsed.source, symbol)
-    {
-        Some(symbol_node) => symbol_node,
-        None => return Ok(None),
-    };
+    Ok(
+        find_symbol_candidates(parsed.tree.root_node(), &parsed.source, symbol, line)
+            .into_iter()
+            .map(|candidate| {
+                let content_node = if include_signature {
+                    candidate.node
+                } else {
+                    candidate
+                        .node
+                        .child_by_field_name("body")
+                        .unwrap_or(candidate.node)
+                };
+                SymbolBody {
+                    content: String::from_utf8_lossy(&parsed.source[content_node.byte_range()])
+                        .to_string(),
+                    start_line: content_node.start_position().row + 1,
+                    end_line: content_node.end_position().row + 1,
+                    declaration_start_line: candidate.node.start_position().row + 1,
+                    declaration_end_line: candidate.node.end_position().row + 1,
+                    name: candidate.name,
+                    qualified_name: candidate.qualified_name,
+                }
+            })
+            .collect(),
+    )
+}
 
-    let content_node = if include_signature {
-        symbol_node
-    } else {
-        symbol_node
-            .child_by_field_name("body")
-            .unwrap_or(symbol_node)
-    };
-
-    let content = String::from_utf8_lossy(&parsed.source[content_node.byte_range()]).to_string();
-    Ok(Some(SymbolBody {
-        content,
-        start_line: content_node.start_position().row + 1,
-        end_line: content_node.end_position().row + 1,
-    }))
+fn ast_candidate_payload(candidate: &AstSymbolMatch) -> Value {
+    json!({
+        "path": candidate.path,
+        "name": candidate.body.name,
+        "qualified_name": candidate.body.qualified_name,
+        "start_line": candidate.body.declaration_start_line,
+        "end_line": candidate.body.declaration_end_line
+    })
 }
 
 fn try_heuristic_match(

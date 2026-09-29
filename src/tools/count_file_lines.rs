@@ -31,29 +31,27 @@ pub async fn execute(args: &Value) -> Result<Value> {
     }
 
     let meta = std::fs::metadata(&path)?;
-    let buffer = std::fs::read(&path)?;
-    let preview = &buffer[..std::cmp::min(buffer.len(), 8192)];
+    let inspection = crate::tools::read_file::inspect_text_file(&path)?;
 
-    if crate::tools::read_file::is_probably_binary(preview) {
+    if inspection.is_binary {
         return Ok(json!({
             "path": crate::common::normalize_display_path(&path),
-            "file_size_bytes": meta.len(),
+            "size_bytes": meta.len(),
             "encoding": Value::Null,
+            "bom": inspection.bom,
             "is_binary": true,
             "line_count": 0,
             "warning": "This appears to be a binary file."
         }));
     }
 
-    let (content, encoding) = crate::tools::read_file::decode_fuzzy(&buffer);
-    let line_count = crate::tools::read_file::count_text_lines(&content);
-
     Ok(json!({
         "path": crate::common::normalize_display_path(&path),
-        "file_size_bytes": meta.len(),
-        "encoding": encoding,
+        "size_bytes": meta.len(),
+        "encoding": inspection.encoding,
+        "bom": inspection.bom,
         "is_binary": false,
-        "line_count": line_count,
-        "ends_with_newline": content.ends_with('\n')
+        "line_count": inspection.line_count,
+        "ends_with_newline": inspection.ends_with_newline
     }))
 }

@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use glob::Pattern;
 use ignore::WalkBuilder;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -12,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 use tokio::task;
 
-use super::path_filters::apply_walk_overrides;
+use super::path_filters::{
+    Pattern, apply_walk_overrides, compile_pattern, configure_walk_filters,
+    filtered_scope_warnings, is_vcs_metadata_dir,
+};
 
 const MAX_FUZZY_RESULTS: usize = 500;
 
@@ -29,7 +31,10 @@ pub fn schema() -> Value {
                 "target_type": { "type": "string", "enum": ["file", "dir", "any"], "description": "Limit matches to files, directories, or both. Use dir to find a good text_search scope." },
                 "extensions": { "type": "array", "items": { "type": "string" }, "description": "Optional file extensions without dots, e.g. rs or cc." },
                 "max_depth": { "type": "integer", "description": "Optional traversal depth for filesystem fallback." },
-                "max_results": { "type": "integer", "description": "Maximum ranked matches to return; defaults are capped to keep responses usable." }
+                "include_ignored": { "type": "boolean", "description": "Include files ignored by .gitignore, .git/info/exclude, global gitignore, or .ignore files." },
+                "include_hidden": { "type": "boolean", "description": "Include hidden files and directories except VCS metadata directories such as .git, unless scoped directly." },
+                "max_results": { "type": "integer", "description": "Maximum ranked matches to return; defaults are capped to keep responses usable." },
+                "verbose": { "type": "boolean", "description": "Include detailed scan and index diagnostics. Incomplete results include diagnostics automatically. Defaults to false." }
             },
             "required": ["pattern"]
         }
@@ -58,6 +63,15 @@ struct FuzzyStats {
     warnings: Vec<String>,
 }
 
+struct FuzzyIndexMetadata {
+    index_used: bool,
+    index_complete: bool,
+    indexed_at: Vec<crate::indexer::PathIndexAge>,
+    index_age_secs: Option<u64>,
+    fallback_reason: Vec<&'static str>,
+    no_fallback_reason: Option<&'static str>,
+}
+
 pub async fn execute(args: &Value) -> Result<Value> {
     let args_owned = args.clone();
     task::spawn_blocking(move || execute_blocking(args_owned))
@@ -71,26 +85,38 @@ fn execute_blocking(args: Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .filter(|value| !value.trim().is_empty())
         .context("Missing/empty pattern")?;
-    let paths: Vec<PathBuf> = args
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| p.as_str())
-                .map(crate::common::resolve_tool_path)
-                .collect()
-        })
-        .unwrap_or_else(|| vec![crate::common::default_tool_root()]);
+    let paths: Vec<PathBuf> = if let Some(paths) = args.get("paths").and_then(|v| v.as_array()) {
+        paths
+            .iter()
+            .filter_map(|path| path.as_str())
+            .map(crate::common::resolve_existing_tool_path)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![crate::common::default_tool_root()]
+    };
 
     let target_type = args
         .get("target_type")
         .and_then(|v| v.as_str())
         .unwrap_or("any");
+    let verbose = args
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let max_results = parse_usize_arg(&args, "max_results", 50, 0, MAX_FUZZY_RESULTS);
-    if max_results == 0 {
-        return Ok(empty_response(pattern, "none", None));
-    }
     let max_depth = args.get("max_depth").and_then(|v| v.as_u64());
+    let include_ignored = args
+        .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_hidden = args
+        .get("include_hidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let suppress_filter_hints = args
+        .get("_suppress_filter_hints")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let extensions: Vec<String> = args
         .get("extensions")
         .and_then(|v| v.as_array())
@@ -109,15 +135,37 @@ fn execute_blocking(args: Value) -> Result<Value> {
         .iter()
         .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
         .collect();
-    if let Some(glob_pattern) = compile_glob_pattern(pattern) {
+    let result_root = crate::common::common_path_root(&search_roots);
+    let display_roots = result_root
+        .as_ref()
+        .map(|root| vec![root.clone()])
+        .unwrap_or_else(|| search_roots.clone());
+    if max_results == 0 {
+        return Ok(empty_response(
+            pattern,
+            "none",
+            None,
+            result_root.as_deref(),
+            &search_roots,
+            verbose,
+        ));
+    }
+    let cancellation = crate::cancellation::token_for_scan(&args, &search_roots);
+    if let Some(glob_pattern) = compile_glob_pattern(pattern)? {
         return execute_glob_find(
             pattern,
             &glob_pattern,
             &search_roots,
+            &display_roots,
             target_type,
             &extensions,
             max_depth,
             max_results,
+            include_ignored,
+            include_hidden,
+            suppress_filter_hints,
+            cancellation.as_ref(),
+            verbose,
         );
     }
 
@@ -130,7 +178,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
     for root in &search_roots {
         process_search_root(
             root,
-            &search_roots,
+            &display_roots,
             pattern,
             target_type,
             &extensions,
@@ -141,8 +189,12 @@ fn execute_blocking(args: Value) -> Result<Value> {
             &mut ranked,
             &mut seen_paths,
             &mut stats,
+            include_ignored,
+            include_hidden,
+            cancellation.as_ref(),
         )?;
     }
+    crate::cancellation::finish_scan_progress(cancellation.as_ref(), stats.entries_scanned);
 
     ranked.sort_by(|left, right| {
         right
@@ -157,15 +209,21 @@ fn execute_blocking(args: Value) -> Result<Value> {
         .take(max_results)
         .map(|item| {
             json!({
-                "path": item.path,
-                "relative_path": item.relative_path,
+                "path": item.relative_path,
                 "score": item.score,
                 "type": item.entry_type,
-                "size": item.size,
+                "size_bytes": item.size,
                 "modified_at": item.modified_at
             })
         })
         .collect();
+    if results.is_empty() && !suppress_filter_hints {
+        stats.warnings.extend(filtered_scope_warnings(
+            &search_roots,
+            include_ignored,
+            include_hidden,
+        ));
+    }
 
     let search_strategy = match (
         stats.indexed_roots_used > 0,
@@ -178,9 +236,17 @@ fn execute_blocking(args: Value) -> Result<Value> {
     };
     let limit_reached = max_results > 0 && results.len() >= max_results;
 
-    Ok(json!({
+    let index_metadata = fuzzy_index_metadata(&search_roots, &stats);
+    let complete = !limit_reached
+        && stats.broad_query_roots_skipped == 0
+        && !cancellation
+            .as_ref()
+            .is_some_and(crate::cancellation::CancellationToken::is_cancelled);
+    let response = json!({
+        "root": result_root.as_deref().map(normalize_path),
         "results": results,
         "total_returned": results.len(),
+        "complete": complete,
         "limit_reached": limit_reached,
         "limit_reason": if limit_reached { Some("max_results") } else { None },
         "search_strategy": search_strategy,
@@ -192,14 +258,32 @@ fn execute_blocking(args: Value) -> Result<Value> {
         "filesystem_roots_walked": stats.filesystem_roots_walked,
         "broad_query_roots_skipped": stats.broad_query_roots_skipped,
         "warnings": stats.warnings,
-        "index_complete": stats.partial_index_roots_used == 0
-    }))
+        "include_ignored": include_ignored,
+        "include_hidden": include_hidden,
+        "index_used": index_metadata.index_used,
+        "index_complete": index_metadata.index_complete,
+        "indexed_at": index_metadata.indexed_at,
+        "index_age_secs": index_metadata.index_age_secs,
+        "fallback_reason": index_metadata.fallback_reason,
+        "no_fallback_reason": index_metadata.no_fallback_reason
+    });
+    Ok(finalize_fuzzy_response(response, verbose, complete))
 }
 
-fn empty_response(pattern: &str, search_strategy: &str, note: Option<String>) -> Value {
-    json!({
+fn empty_response(
+    pattern: &str,
+    search_strategy: &str,
+    note: Option<String>,
+    result_root: Option<&Path>,
+    search_roots: &[PathBuf],
+    verbose: bool,
+) -> Value {
+    let index_metadata = fuzzy_index_metadata(search_roots, &FuzzyStats::default());
+    let response = json!({
+        "root": result_root.map(normalize_path),
         "results": [],
         "total_returned": 0,
+        "complete": true,
         "limit_reached": false,
         "limit_reason": None::<String>,
         "search_strategy": search_strategy,
@@ -211,20 +295,33 @@ fn empty_response(pattern: &str, search_strategy: &str, note: Option<String>) ->
         "filesystem_roots_walked": 0,
         "broad_query_roots_skipped": 0,
         "warnings": Vec::<String>::new(),
-        "index_complete": true,
+        "index_used": index_metadata.index_used,
+        "index_complete": index_metadata.index_complete,
+        "indexed_at": index_metadata.indexed_at,
+        "index_age_secs": index_metadata.index_age_secs,
+        "fallback_reason": index_metadata.fallback_reason,
+        "no_fallback_reason": index_metadata.no_fallback_reason,
         "pattern": pattern,
         "note": note
-    })
+    });
+    finalize_fuzzy_response(response, verbose, true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_glob_find(
     pattern: &str,
     glob_pattern: &Pattern,
     search_roots: &[PathBuf],
+    display_roots: &[PathBuf],
     target_type: &str,
     extensions: &[String],
     max_depth: Option<u64>,
     max_results: usize,
+    include_ignored: bool,
+    include_hidden: bool,
+    suppress_filter_hints: bool,
+    cancellation: Option<&crate::cancellation::CancellationToken>,
+    verbose: bool,
 ) -> Result<Value> {
     let mut ranked = Vec::new();
     let mut seen_paths = HashSet::new();
@@ -233,7 +330,7 @@ fn execute_glob_find(
     for root in search_roots {
         process_glob_root(
             root,
-            search_roots,
+            display_roots,
             glob_pattern,
             target_type,
             extensions,
@@ -242,8 +339,12 @@ fn execute_glob_find(
             &mut ranked,
             &mut seen_paths,
             &mut stats,
+            include_ignored,
+            include_hidden,
+            cancellation,
         )?;
     }
+    crate::cancellation::finish_scan_progress(cancellation, stats.entries_scanned);
 
     ranked.sort_by(compare_ranked_match);
     let results: Vec<Value> = ranked
@@ -251,15 +352,21 @@ fn execute_glob_find(
         .take(max_results)
         .map(|item| {
             json!({
-                "path": item.path,
-                "relative_path": item.relative_path,
+                "path": item.relative_path,
                 "score": item.score,
                 "type": item.entry_type,
-                "size": item.size,
+                "size_bytes": item.size,
                 "modified_at": item.modified_at
             })
         })
         .collect();
+    if results.is_empty() && !suppress_filter_hints {
+        stats.warnings.extend(filtered_scope_warnings(
+            search_roots,
+            include_ignored,
+            include_hidden,
+        ));
+    }
     let search_strategy = match (
         stats.indexed_roots_used > 0,
         stats.filesystem_roots_walked > 0,
@@ -271,9 +378,16 @@ fn execute_glob_find(
     };
     let limit_reached = max_results > 0 && results.len() >= max_results;
 
-    Ok(json!({
+    let index_metadata = fuzzy_index_metadata(search_roots, &stats);
+    let result_root = crate::common::common_path_root(search_roots);
+    let complete = !limit_reached
+        && stats.broad_query_roots_skipped == 0
+        && !cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled);
+    let response = json!({
+        "root": result_root.as_deref().map(normalize_path),
         "results": results,
         "total_returned": results.len(),
+        "complete": complete,
         "limit_reached": limit_reached,
         "limit_reason": if limit_reached { Some("max_results") } else { None },
         "search_strategy": search_strategy,
@@ -286,9 +400,109 @@ fn execute_glob_find(
         "filesystem_roots_walked": stats.filesystem_roots_walked,
         "broad_query_roots_skipped": stats.broad_query_roots_skipped,
         "warnings": stats.warnings,
-        "index_complete": stats.partial_index_roots_used == 0,
+        "include_ignored": include_ignored,
+        "include_hidden": include_hidden,
+        "index_used": index_metadata.index_used,
+        "index_complete": index_metadata.index_complete,
+        "indexed_at": index_metadata.indexed_at,
+        "index_age_secs": index_metadata.index_age_secs,
+        "fallback_reason": index_metadata.fallback_reason,
+        "no_fallback_reason": index_metadata.no_fallback_reason,
         "note": format!("Pattern '{}' was treated as a glob; match is applied to relative path and file name.", pattern)
-    }))
+    });
+    Ok(finalize_fuzzy_response(response, verbose, complete))
+}
+
+fn fuzzy_index_metadata(search_roots: &[PathBuf], stats: &FuzzyStats) -> FuzzyIndexMetadata {
+    let indexed_at = crate::indexer::path_index_ages_for_paths(search_roots);
+    let index_used = stats.indexed_roots_used > 0;
+    let index_complete = !indexed_at.is_empty()
+        && indexed_at.iter().all(|item| item.complete)
+        && stats.partial_index_roots_used == 0;
+    let index_age_secs = indexed_at
+        .iter()
+        .filter_map(|item| item.index_age_secs)
+        .max();
+    let fallback_reason = if stats.filesystem_roots_walked > 0 {
+        if index_used {
+            vec!["path_index_incomplete_or_unselective"]
+        } else {
+            vec!["path_index_unavailable_or_bypassed"]
+        }
+    } else {
+        Vec::new()
+    };
+    let no_fallback_reason = (index_used && index_complete && stats.filesystem_roots_walked == 0)
+        .then_some("index_complete");
+
+    FuzzyIndexMetadata {
+        index_used,
+        index_complete,
+        indexed_at,
+        index_age_secs,
+        fallback_reason,
+        no_fallback_reason,
+    }
+}
+
+fn fuzzy_diagnostics(response: &Value) -> Value {
+    let mut diagnostics = serde_json::Map::new();
+    for key in [
+        "entries_scanned",
+        "indexed_candidates_considered",
+        "indexed_candidates_accepted",
+        "indexed_roots_used",
+        "partial_index_roots_used",
+        "filesystem_roots_walked",
+        "broad_query_roots_skipped",
+        "warnings",
+        "indexed_at",
+        "fallback_reason",
+        "no_fallback_reason",
+        "include_ignored",
+        "include_hidden",
+    ] {
+        if let Some(value) = response.get(key)
+            && !value.is_null()
+            && !matches!(value, Value::Array(items) if items.is_empty())
+        {
+            diagnostics.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(diagnostics)
+}
+
+fn finalize_fuzzy_response(mut response: Value, verbose: bool, complete: bool) -> Value {
+    let include_diagnostics = verbose
+        || !complete
+        || response
+            .get("warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| !warnings.is_empty());
+    let diagnostics = fuzzy_diagnostics(&response);
+    if let Some(object) = response.as_object_mut() {
+        for key in [
+            "entries_scanned",
+            "indexed_candidates_considered",
+            "indexed_candidates_accepted",
+            "indexed_roots_used",
+            "partial_index_roots_used",
+            "filesystem_roots_walked",
+            "broad_query_roots_skipped",
+            "warnings",
+            "indexed_at",
+            "fallback_reason",
+            "no_fallback_reason",
+            "include_ignored",
+            "include_hidden",
+        ] {
+            object.remove(key);
+        }
+    }
+    if include_diagnostics {
+        crate::common::insert_object_field(&mut response, "diagnostics", diagnostics);
+    }
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,14 +517,20 @@ fn process_glob_root(
     ranked: &mut Vec<RankedMatch>,
     seen_paths: &mut HashSet<String>,
     stats: &mut FuzzyStats,
+    include_ignored: bool,
+    include_hidden: bool,
+    cancellation: Option<&crate::cancellation::CancellationToken>,
 ) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
 
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let index_ready = crate::indexer::is_path_index_ready(&canonical_root);
-    let has_index = crate::indexer::is_path_index_available(&canonical_root);
+    let index_ready =
+        !include_ignored && !include_hidden && crate::indexer::is_path_index_ready(&canonical_root);
+    let has_index = !include_ignored
+        && !include_hidden
+        && crate::indexer::is_path_index_available(&canonical_root);
     let has_glob_anchors = !glob_anchor_terms(glob_pattern.as_str()).is_empty();
     if has_index
         && let Some(candidates) = crate::indexer::query_path_candidates(
@@ -326,11 +546,21 @@ fn process_glob_root(
         let mut indexed_accepted = 0usize;
         for candidate in candidates {
             stats.entries_scanned = stats.entries_scanned.saturating_add(1);
+            if crate::cancellation::report_scan_progress(cancellation, stats.entries_scanned) {
+                return Ok(());
+            }
             stats.indexed_candidates_considered =
                 stats.indexed_candidates_considered.saturating_add(1);
+            let Ok(metadata) = std::fs::metadata(&candidate.path) else {
+                continue;
+            };
+            let is_dir = metadata.is_dir();
+            if !is_dir && !metadata.is_file() {
+                continue;
+            }
             if consider_glob_record(
                 &candidate.path,
-                candidate.is_dir,
+                is_dir,
                 all_roots,
                 glob_pattern,
                 target_type,
@@ -339,7 +569,7 @@ fn process_glob_root(
                 max_results,
                 ranked,
                 seen_paths,
-                Some((candidate.size, candidate.modified_at)),
+                Some(metadata_parts(&metadata)),
             ) {
                 indexed_accepted = indexed_accepted.saturating_add(1);
             }
@@ -350,48 +580,48 @@ fn process_glob_root(
         if indexed_accepted > 0 || (index_ready && has_glob_anchors) {
             return Ok(());
         }
-    } else if index_ready && has_glob_anchors {
-        stats.indexed_roots_used += 1;
-        return Ok(());
     }
 
-    if crate::indexer::is_path_index_available(&canonical_root) {
+    if has_index {
         stats.indexed_roots_used += 1;
         if !index_ready {
             stats.partial_index_roots_used += 1;
         }
-        let _ = crate::indexer::visit_indexed_entries_under(&canonical_root, |entry| {
-            stats.entries_scanned = stats.entries_scanned.saturating_add(1);
-            stats.indexed_candidates_considered =
-                stats.indexed_candidates_considered.saturating_add(1);
-            if consider_glob_record(
-                &entry.path,
-                entry.is_dir,
-                all_roots,
-                glob_pattern,
-                target_type,
-                extensions,
-                max_depth,
-                max_results,
-                ranked,
-                seen_paths,
-                Some((entry.size, entry.modified_at)),
-            ) {
-                stats.indexed_candidates_accepted =
-                    stats.indexed_candidates_accepted.saturating_add(1);
-            }
-            true
-        });
-        return Ok(());
+        let indexed_entries =
+            crate::indexer::visit_indexed_entries_under(&canonical_root, |entry| {
+                stats.entries_scanned = stats.entries_scanned.saturating_add(1);
+                if crate::cancellation::report_scan_progress(cancellation, stats.entries_scanned) {
+                    return false;
+                }
+                stats.indexed_candidates_considered =
+                    stats.indexed_candidates_considered.saturating_add(1);
+                if consider_glob_record(
+                    &entry.path,
+                    entry.is_dir,
+                    all_roots,
+                    glob_pattern,
+                    target_type,
+                    extensions,
+                    max_depth,
+                    max_results,
+                    ranked,
+                    seen_paths,
+                    Some((entry.size, entry.modified_at)),
+                ) {
+                    stats.indexed_candidates_accepted =
+                        stats.indexed_candidates_accepted.saturating_add(1);
+                }
+                true
+            });
+        if indexed_entries.unwrap_or(0) > 0 {
+            crate::cancellation::finish_scan_progress(cancellation, stats.entries_scanned);
+            return Ok(());
+        }
     }
 
     let mut walk = WalkBuilder::new(&canonical_root);
-    walk.hidden(true)
-        .ignore(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .threads(crate::common::bounded_walk_threads());
+    configure_walk_filters(&mut walk, include_ignored, include_hidden);
+    walk.threads(crate::common::bounded_walk_threads());
     if let Some(depth) = max_depth {
         walk.max_depth(Some(depth as usize));
     }
@@ -399,11 +629,19 @@ fn process_glob_root(
     if !extension_globs.is_empty() {
         apply_walk_overrides(&mut walk, &canonical_root, &extension_globs, &[])?;
     }
+    let filter_root = canonical_root.clone();
+    walk.filter_entry(move |entry| {
+        !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+            || !is_vcs_metadata_dir(entry.path(), &filter_root)
+    });
 
     stats.filesystem_roots_walked += 1;
     let local_ranked = Arc::new(Mutex::new(Vec::<RankedMatch>::new()));
     let local_seen = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let entries_scanned = Arc::new(AtomicUsize::new(0));
+    let entries_scanned = Arc::new(AtomicUsize::new(stats.entries_scanned));
+    let closure_cancellation = cancellation.cloned();
     let closure_roots = all_roots.to_vec();
     let closure_pattern = glob_pattern.clone();
     let closure_target_type = target_type.to_string();
@@ -419,9 +657,15 @@ fn process_glob_root(
         let glob_pattern = closure_pattern.clone();
         let target_type = closure_target_type.clone();
         let extensions = closure_extensions.clone();
+        let cancellation = closure_cancellation.clone();
 
         Box::new(move |entry| {
-            entries_scanned.fetch_add(1, Ordering::Relaxed);
+            let entries_seen = entries_scanned
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if crate::cancellation::report_scan_progress(cancellation.as_ref(), entries_seen) {
+                return ignore::WalkState::Quit;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => return ignore::WalkState::Continue,
@@ -455,9 +699,7 @@ fn process_glob_root(
         })
     });
 
-    stats.entries_scanned = stats
-        .entries_scanned
-        .saturating_add(entries_scanned.load(Ordering::Relaxed));
+    stats.entries_scanned = entries_scanned.load(Ordering::Relaxed);
     let local_ranked = match Arc::try_unwrap(local_ranked) {
         Ok(mutex) => mutex
             .into_inner()
@@ -514,13 +756,11 @@ fn consider_glob_record(
         return false;
     }
 
-    let relative_lower = relative_path.to_ascii_lowercase();
-    let file_name_lower = path
+    let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !glob_pattern.matches(&relative_lower) && !glob_pattern.matches(&file_name_lower) {
+        .unwrap_or_default();
+    if !glob_pattern.matches(&relative_path) && !glob_pattern.matches(file_name) {
         return false;
     }
 
@@ -560,6 +800,9 @@ fn process_search_root(
     ranked: &mut Vec<RankedMatch>,
     seen_paths: &mut HashSet<String>,
     stats: &mut FuzzyStats,
+    include_ignored: bool,
+    include_hidden: bool,
+    cancellation: Option<&crate::cancellation::CancellationToken>,
 ) -> Result<()> {
     if !root.exists() {
         return Ok(());
@@ -568,6 +811,10 @@ fn process_search_root(
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     if canonical_root.is_file() {
+        stats.entries_scanned = stats.entries_scanned.saturating_add(1);
+        if crate::cancellation::report_scan_progress(cancellation, stats.entries_scanned) {
+            return Ok(());
+        }
         consider_candidate(
             &canonical_root,
             false,
@@ -590,15 +837,19 @@ fn process_search_root(
         return Ok(());
     }
 
-    let index_complete = crate::indexer::is_path_index_ready(&canonical_root);
-    if crate::indexer::is_path_index_available(&canonical_root)
+    let index_complete =
+        !include_ignored && !include_hidden && crate::indexer::is_path_index_ready(&canonical_root);
+    let small_indexed_workspace = crate::indexer::indexed_workspace_file_count(&canonical_root)
+        .is_some_and(|count| count <= crate::indexer::LARGE_WORKSPACE_FILE_THRESHOLD);
+    if !include_ignored
+        && !include_hidden
+        && crate::indexer::is_path_index_available(&canonical_root)
         && let Some(candidates) = crate::indexer::query_path_candidates(
             &canonical_root,
             pattern,
             indexed_shortlist_limit(max_results),
         )
     {
-        let index_candidate_count = candidates.len();
         stats.indexed_roots_used += 1;
         if !index_complete {
             stats.partial_index_roots_used += 1;
@@ -623,6 +874,10 @@ fn process_search_root(
         }
 
         for candidate in candidates {
+            stats.entries_scanned = stats.entries_scanned.saturating_add(1);
+            if crate::cancellation::report_scan_progress(cancellation, stats.entries_scanned) {
+                return Ok(());
+            }
             stats.indexed_candidates_considered =
                 stats.indexed_candidates_considered.saturating_add(1);
             if consider_indexed_candidate(
@@ -643,11 +898,8 @@ fn process_search_root(
             }
         }
 
-        if index_candidate_count > 0 {
-            return Ok(());
-        }
-
         if index_complete
+            && !small_indexed_workspace
             && should_skip_broad_filesystem_fallback(pattern, filter_terms, extensions, max_depth)
         {
             stats.broad_query_roots_skipped += 1;
@@ -661,12 +913,8 @@ fn process_search_root(
     }
 
     let mut walk = WalkBuilder::new(&canonical_root);
-    walk.hidden(true)
-        .ignore(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .threads(crate::common::bounded_walk_threads());
+    configure_walk_filters(&mut walk, include_ignored, include_hidden);
+    walk.threads(crate::common::bounded_walk_threads());
     if let Some(depth) = max_depth {
         walk.max_depth(Some(depth as usize));
     }
@@ -674,11 +922,19 @@ fn process_search_root(
     if !extension_globs.is_empty() {
         apply_walk_overrides(&mut walk, &canonical_root, &extension_globs, &[])?;
     }
+    let filter_root = canonical_root.clone();
+    walk.filter_entry(move |entry| {
+        !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+            || !is_vcs_metadata_dir(entry.path(), &filter_root)
+    });
 
     stats.filesystem_roots_walked += 1;
     let local_ranked = Arc::new(Mutex::new(Vec::<RankedMatch>::new()));
     let local_seen = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let entries_scanned = Arc::new(AtomicUsize::new(0));
+    let entries_scanned = Arc::new(AtomicUsize::new(stats.entries_scanned));
+    let closure_cancellation = cancellation.cloned();
     let closure_roots = all_roots.to_vec();
     let closure_pattern = pattern.to_string();
     let closure_target_type = target_type.to_string();
@@ -696,10 +952,16 @@ fn process_search_root(
         let target_type = closure_target_type.clone();
         let extensions = closure_extensions.clone();
         let filter_terms = closure_filter_terms.clone();
+        let cancellation = closure_cancellation.clone();
         let matcher = SkimMatcherV2::default();
 
         Box::new(move |entry| {
-            entries_scanned.fetch_add(1, Ordering::Relaxed);
+            let entries_seen = entries_scanned
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if crate::cancellation::report_scan_progress(cancellation.as_ref(), entries_seen) {
+                return ignore::WalkState::Quit;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => return ignore::WalkState::Continue,
@@ -750,9 +1012,7 @@ fn process_search_root(
         })
     });
 
-    stats.entries_scanned = stats
-        .entries_scanned
-        .saturating_add(entries_scanned.load(Ordering::Relaxed));
+    stats.entries_scanned = entries_scanned.load(Ordering::Relaxed);
 
     let local_ranked = match Arc::try_unwrap(local_ranked) {
         Ok(mutex) => mutex
@@ -824,9 +1084,16 @@ fn consider_indexed_candidate(
     ranked: &mut Vec<RankedMatch>,
     seen_paths: &mut HashSet<String>,
 ) -> bool {
+    let Ok(metadata) = std::fs::metadata(&candidate.path) else {
+        return false;
+    };
+    let is_dir = metadata.is_dir();
+    if !is_dir && !metadata.is_file() {
+        return false;
+    }
     let Some(candidate) = score_candidate_from_parts(
         &candidate.path,
-        candidate.is_dir,
+        is_dir,
         compute_relative_path(&candidate.path, roots),
         pattern,
         target_type,
@@ -834,7 +1101,7 @@ fn consider_indexed_candidate(
         filter_terms,
         max_depth,
         matcher,
-        Some((candidate.size, candidate.modified_at)),
+        Some(metadata_parts(&metadata)),
     ) else {
         return false;
     };
@@ -1006,15 +1273,15 @@ fn term_containment_score(score_target_lower: &str, filter_terms: &[String]) -> 
 
 fn compute_relative_path(path: &Path, roots: &[PathBuf]) -> String {
     for root in roots {
-        if let Ok(stripped) = path.strip_prefix(root) {
-            if stripped.as_os_str().is_empty() {
+        if let Some(stripped) = crate::common::relative_display_path(path, root) {
+            if stripped.is_empty() {
                 return path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or_default()
                     .to_string();
             }
-            return normalize_path(stripped);
+            return stripped;
         }
     }
 
@@ -1033,12 +1300,14 @@ fn indexed_shortlist_limit(max_results: usize) -> usize {
     max_results.saturating_mul(64).clamp(256, 4096)
 }
 
-fn compile_glob_pattern(pattern: &str) -> Option<Pattern> {
-    if !pattern.chars().any(|ch| matches!(ch, '*' | '?' | '[')) {
-        return None;
+fn compile_glob_pattern(pattern: &str) -> Result<Option<Pattern>> {
+    if !pattern
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | '{'))
+    {
+        return Ok(None);
     }
-    let normalized = pattern.replace('\\', "/").to_ascii_lowercase();
-    Pattern::new(&normalized).ok()
+    compile_pattern(pattern).map(Some)
 }
 
 fn glob_anchor_terms(pattern: &str) -> Vec<String> {

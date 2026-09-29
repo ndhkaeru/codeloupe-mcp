@@ -38,7 +38,7 @@ pub fn write_bytes(path: &Path, bytes: &[u8], replace_existing: bool) -> io::Res
         let _ = fs::set_permissions(&temp_path, metadata.permissions());
     }
 
-    match fs::rename(&temp_path, path) {
+    let result = match fs::rename(&temp_path, path) {
         Ok(()) => {
             cleanup.forget();
             Ok(())
@@ -57,7 +57,13 @@ pub fn write_bytes(path: &Path, bytes: &[u8], replace_existing: bool) -> io::Res
             }
         }
         Err(err) => Err(err),
+    };
+    if result.is_ok()
+        && let Some(parent) = path.parent()
+    {
+        crate::indexer::notify_content_directory_changed(parent);
     }
+    result
 }
 
 #[cfg(windows)]

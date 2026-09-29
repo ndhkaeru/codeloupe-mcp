@@ -7,12 +7,11 @@ use crate::history::{
     attach_history_metadata, capture_snapshot, file_snapshot, missing_snapshot, no_history,
     record_change,
 };
-use crate::security::path_guard::{GUARD, Tier};
+use crate::security::path_guard::GUARD;
 
 fn error_reason(error_code: &str) -> &'static str {
     match error_code {
         "invalid_path" => "Path argument is missing or invalid.",
-        "path_blocked" => "Path is blocked by server policy.",
         "invalid_encoding" => "Requested encoding is not supported.",
         "invalid_line_ending" => "Requested line ending mode is invalid.",
         "encoding_error" => "Content cannot be encoded with requested encoding.",
@@ -70,17 +69,7 @@ fn io_error_response(
     operation: &str,
     err: &std::io::Error,
 ) -> Value {
-    let error_code = if err.raw_os_error() == Some(32) {
-        "file_locked"
-    } else {
-        match err.kind() {
-            std::io::ErrorKind::PermissionDenied => "permission_denied",
-            std::io::ErrorKind::NotFound => "not_found",
-            std::io::ErrorKind::AlreadyExists => "already_exists",
-            std::io::ErrorKind::InvalidInput => "invalid_input",
-            _ => "io_error",
-        }
-    };
+    let error_code = super::file_io_error::classify(path, err, "not_found");
 
     json!({
         "success": false,
@@ -154,16 +143,8 @@ pub async fn execute(args: &Value) -> Result<Value> {
         ));
     }
 
-    let path = crate::common::resolve_tool_path(path_str);
-    let (canonical_from_guard, tier, reason) = GUARD.check_path(&path);
-    if tier == Tier::Blocked {
-        return Ok(error_response(
-            &path,
-            &canonical_from_guard,
-            "path_blocked",
-            reason.unwrap_or_else(|| "path is blocked by server policy".to_string()),
-        ));
-    }
+    let path = crate::common::resolve_write_tool_path(path_str);
+    let canonical_from_guard = GUARD.check_path(&path);
 
     let overwrite = args
         .get("overwrite")
@@ -288,6 +269,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
     }
 
     let canonical_written = std::fs::canonicalize(&path).unwrap_or(canonical_from_guard);
+    let sha256_after = super::file_hash::sha256_bytes(&final_bytes);
     let history_outcome = match before_snapshot {
         Ok(before) => record_change(
             "create_file",
@@ -316,6 +298,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
         "bytes_written": final_bytes.len(),
         "target_encoding": normalized_encoding,
         "line_ending": line_ending_applied,
+        "sha256_after": sha256_after,
         "message": if existed_before { "file overwritten" } else { "file created" }
     });
     attach_history_metadata(&mut response, &history_outcome);

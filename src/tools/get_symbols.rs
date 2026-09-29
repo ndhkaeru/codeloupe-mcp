@@ -39,7 +39,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
     let symbols = collect_symbols(parsed.tree.root_node(), &parsed.source);
 
     Ok(json!({
-        "file": crate::common::normalize_display_path(&path),
+        "path": crate::common::normalize_display_path(&path),
         "language": parsed.language_name,
         "total_symbols": symbols.len(),
         "symbols": symbols

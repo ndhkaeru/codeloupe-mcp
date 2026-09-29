@@ -6,12 +6,11 @@ use std::path::{Path, PathBuf};
 use crate::history::{
     attach_history_metadata, directory_snapshot, missing_snapshot, no_history, record_change,
 };
-use crate::security::path_guard::{GUARD, Tier};
+use crate::security::path_guard::GUARD;
 
 fn error_reason(error_code: &str) -> &'static str {
     match error_code {
         "invalid_path" => "Path argument is missing or invalid.",
-        "path_blocked" => "Path is blocked by server policy.",
         "path_is_file" => "Target path points to a file, not a directory.",
         "already_exists" => "Target directory already exists.",
         "parent_missing" => "Parent directory does not exist.",
@@ -33,7 +32,7 @@ pub fn schema() -> Value {
             "properties": {
                 "path": { "type": "string" },
                 "create_parents": { "type": "boolean" },
-                "allow_existing": { "type": "boolean" }
+                "allow_existing": { "type": "boolean", "default": true, "description": "Treat an existing directory as success. Defaults to true." }
             },
             "required": ["path"]
         }
@@ -62,16 +61,7 @@ fn io_error_response(
     operation: &str,
     err: &std::io::Error,
 ) -> Value {
-    let error_code = if err.raw_os_error() == Some(32) {
-        "file_locked"
-    } else {
-        match err.kind() {
-            std::io::ErrorKind::PermissionDenied => "permission_denied",
-            std::io::ErrorKind::AlreadyExists => "already_exists",
-            std::io::ErrorKind::InvalidInput => "invalid_input",
-            _ => "io_error",
-        }
-    };
+    let error_code = super::file_io_error::classify(path, err, "not_found");
 
     json!({
         "success": false,
@@ -103,16 +93,8 @@ pub async fn execute(args: &Value) -> Result<Value> {
         ));
     }
 
-    let path = crate::common::resolve_tool_path(path_str);
-    let (canonical_from_guard, tier, reason) = GUARD.check_path(&path);
-    if tier == Tier::Blocked {
-        return Ok(error_response(
-            &path,
-            &canonical_from_guard,
-            "path_blocked",
-            reason.unwrap_or_else(|| "path is blocked by server policy".to_string()),
-        ));
-    }
+    let path = crate::common::resolve_write_tool_path(path_str);
+    let canonical_from_guard = GUARD.check_path(&path);
 
     let create_parents = args
         .get("create_parents")

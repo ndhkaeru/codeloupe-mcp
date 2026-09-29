@@ -53,7 +53,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
     );
 
     Ok(json!({
-        "file": crate::common::normalize_display_path(&path),
+        "path": crate::common::normalize_display_path(&path),
         "language": parsed.language_name,
         "imports": imports,
         "total_imports": imports.len()
@@ -78,12 +78,11 @@ fn collect_imports_recursive(
                     .trim()
                     .to_string();
 
+                // `clause` and `statement` would only repeat `source` here.
                 imports.push(json!({
                     "line": node.start_position().row + 1,
                     "kind": if is_public { "pub_use" } else { "use" },
-                    "source": clause,
-                    "clause": clause,
-                    "statement": trimmed
+                    "source": clause
                 }));
             }
         }
@@ -118,9 +117,7 @@ fn collect_imports_recursive(
                 imports.push(json!({
                     "line": node.start_position().row + 1,
                     "kind": "import",
-                    "source": clause,
-                    "clause": clause,
-                    "statement": trimmed
+                    "source": clause
                 }));
             }
         }
@@ -134,11 +131,11 @@ fn collect_imports_recursive(
                     .trim()
                     .trim_matches(|c| c == '"' || c == '<' || c == '>')
                     .to_string();
+                // `statement` stays: it tells `<system>` from `"local"` includes.
                 imports.push(json!({
                     "line": node.start_position().row + 1,
                     "kind": if is_import { "import" } else { "include" },
                     "source": path_value,
-                    "clause": path_value,
                     "statement": trimmed
                 }));
             }

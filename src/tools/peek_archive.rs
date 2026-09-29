@@ -4,6 +4,11 @@ use serde_json::{Value, json};
 use std::fs::File;
 use std::io::Read;
 
+use crate::limits::MAX_IN_MEMORY_TEXT_FILE_BYTES;
+
+const MAX_INNER_FILE_BYTES: usize = MAX_IN_MEMORY_TEXT_FILE_BYTES as usize;
+const MAX_LISTED_ENTRIES: usize = 1_000;
+
 fn normalize_archive_entry_path(raw: &str) -> String {
     raw.replace('\\', "/").trim_start_matches("./").to_string()
 }
@@ -12,7 +17,7 @@ pub fn schema() -> Value {
     json!({
         "name": "peek_archive",
         "title": "Peek archive",
-        "description": "List archive entries or read one file inside an archive without extracting it. Use for source bundles or release artifacts; prefer inner_path for targeted reads.",
+        "description": "List up to 1000 archive entries or read one file of at most 10 MiB without extracting it. Use for source bundles or release artifacts; prefer inner_path for targeted reads.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -73,13 +78,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
                     .context(format!("File {} not found inside archive", inner_path))?;
                 archive.by_index(index)?
             };
-            let mut buffer = Vec::new();
-
-            // Limit 10MB
-            file_in_zip.read_to_end(&mut buffer)?;
-            if buffer.len() > 10 * 1024 * 1024 {
-                return Err(anyhow::anyhow!("Inner file is too large (> 10MB)"));
-            }
+            let buffer = read_limited_entry(&mut file_in_zip)?;
 
             let (content, enc) = crate::tools::read_file::decode_fuzzy(&buffer);
 
@@ -90,12 +89,13 @@ pub async fn execute(args: &Value) -> Result<Value> {
                 "content": content
             }))
         } else {
+            let total_entries = archive.len();
             let mut entries = Vec::new();
-            for i in 0..archive.len() {
+            for i in 0..total_entries.min(MAX_LISTED_ENTRIES) {
                 if let Ok(file) = archive.by_index(i) {
                     entries.push(json!({
                         "name": normalize_archive_entry_path(file.name()),
-                        "size": file.size(),
+                        "size_bytes": file.size(),
                         "is_dir": file.is_dir()
                     }));
                 }
@@ -103,7 +103,9 @@ pub async fn execute(args: &Value) -> Result<Value> {
             Ok(json!({
                 "archive": archive_path_str,
                 "entries": entries,
-                "total_entries": entries.len()
+                "entries_returned": entries.len(),
+                "entries_complete": total_entries <= MAX_LISTED_ENTRIES,
+                "total_entries": total_entries
             }))
         }
     } else if is_tar || is_tar_gz {
@@ -126,7 +128,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
                 let mut entry = entry?;
                 let entry_name = normalize_archive_entry_path(&entry.path()?.to_string_lossy());
                 if entry_name == inner_path {
-                    entry.read_to_end(&mut buf)?;
+                    buf = read_limited_entry(&mut entry)?;
                     found = true;
                     break;
                 }
@@ -139,10 +141,6 @@ pub async fn execute(args: &Value) -> Result<Value> {
                 ));
             }
 
-            if buf.len() > 10 * 1024 * 1024 {
-                return Err(anyhow::anyhow!("Inner file is too large (> 10MB)"));
-            }
-
             let (content, enc) = crate::tools::read_file::decode_fuzzy(&buf);
 
             Ok(json!({
@@ -153,18 +151,25 @@ pub async fn execute(args: &Value) -> Result<Value> {
             }))
         } else {
             let mut entries = Vec::new();
+            let mut entries_complete = true;
             for entry in archive.entries()? {
+                if entries.len() >= MAX_LISTED_ENTRIES {
+                    entries_complete = false;
+                    break;
+                }
                 let entry = entry?;
                 entries.push(json!({
                     "name": normalize_archive_entry_path(&entry.path()?.to_string_lossy()),
-                    "size": entry.header().size()?,
+                    "size_bytes": entry.header().size()?,
                     "is_dir": entry.header().entry_type().is_dir()
                 }));
             }
             Ok(json!({
                 "archive": archive_path_str,
                 "entries": entries,
-                "total_entries": entries.len()
+                "entries_returned": entries.len(),
+                "entries_complete": entries_complete,
+                "total_entries": if entries_complete { json!(entries.len()) } else { Value::Null }
             }))
         }
     } else {
@@ -172,4 +177,15 @@ pub async fn execute(args: &Value) -> Result<Value> {
             "Unsupported archive format. Supported formats: .zip, .tar, .tar.gz"
         ))
     }
+}
+
+fn read_limited_entry(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    reader
+        .take((MAX_INNER_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut buffer)?;
+    if buffer.len() > MAX_INNER_FILE_BYTES {
+        return Err(anyhow::anyhow!("Inner file is too large (> 10 MiB)"));
+    }
+    Ok(buffer)
 }

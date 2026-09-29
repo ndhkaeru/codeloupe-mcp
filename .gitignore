@@ -29,6 +29,7 @@ pnpm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
+docs/
 
 # Temporary files
 *.tmp

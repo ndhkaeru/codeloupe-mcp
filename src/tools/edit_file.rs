@@ -6,15 +6,24 @@ use std::path::{Path, PathBuf};
 use crate::history::{
     attach_history_metadata, file_snapshot, missing_snapshot, no_history, record_change,
 };
-use crate::security::path_guard::{GUARD, Tier};
+use crate::limits::MAX_IN_MEMORY_TEXT_FILE_BYTES;
+use crate::security::path_guard::GUARD;
 use crate::tools::read_file::decode_fuzzy;
+use crate::tools::text_encoding::TextEncoding;
 
-const MAX_EDIT_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_EDIT_FILE_BYTES: u64 = MAX_IN_MEMORY_TEXT_FILE_BYTES;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExistingLineEndings {
+    None,
+    Lf,
+    Crlf,
+    Mixed,
+}
 
 fn error_reason(error_code: &str) -> &'static str {
     match error_code {
         "invalid_path" => "Path argument is missing or invalid.",
-        "path_blocked" => "Path is blocked by server policy.",
         "invalid_mode" => "Mode is not one of supported values.",
         "path_is_directory" => "Target path points to a directory, not a file.",
         "file_too_large" => "File exceeds allowed size for this operation.",
@@ -31,6 +40,8 @@ fn error_reason(error_code: &str) -> &'static str {
         "not_found" => "Target path was not found.",
         "invalid_input" => "Input is invalid for the requested operation.",
         "file_locked" => "File is locked by another process.",
+        "invalid_hash" => "Expected hash is not a valid SHA-256 digest.",
+        "hash_mismatch" => "File contents do not match the expected SHA-256 digest.",
         "io_error" => "Filesystem I/O error occurred.",
         _ => "Unknown error.",
     }
@@ -44,7 +55,7 @@ pub fn schema() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File path to edit. Relative paths resolve against the active workspace." },
+                "path": { "type": "string", "description": "File path to edit. Relative paths resolve against a configured workspace, then the active workspace." },
                 "mode": {
                     "type": "string",
                     "enum": ["replace", "append", "prepend", "find_replace"],
@@ -54,9 +65,10 @@ pub fn schema() -> Value {
                 "replace": { "type": "string", "description": "Replacement text for find_replace mode. Required for find_replace; may be an empty string to delete matches." },
                 "replace_all": { "type": "boolean", "description": "In find_replace mode, replace every match when true; replace only the first match when false or omitted." },
                 "expected_replacements": { "type": "integer", "description": "Optional safety check for find_replace. The tool fails unless the actual replacement count equals this value. Useful with replace_all to avoid accidental broad edits." },
+                "expected_hash": { "type": "string", "description": "Optional SHA-256 precondition. The edit is rejected if the current file does not match this 64-character hex digest." },
                 "create_if_missing": { "type": "boolean", "description": "Allow creating the file when it does not exist. Defaults to false." },
                 "create_parents": { "type": "boolean", "description": "Create missing parent directories when writing. Defaults to true." },
-                "target_encoding": { "type": "string", "enum": ["UTF-8", "Windows-1252"], "description": "Output encoding. Defaults to the detected existing encoding, or UTF-8 for new files." },
+                "target_encoding": { "type": "string", "enum": ["UTF-8", "UTF-16LE", "UTF-16BE", "Windows-1252"], "description": "Output encoding. Defaults to the detected existing encoding, or UTF-8 for new files. UTF-16 output includes a BOM." },
                 "target_line_ending": {
                     "type": "string",
                     "enum": ["preserve", "lf", "crlf"],
@@ -89,17 +101,7 @@ fn io_error_response(
     operation: &str,
     err: &std::io::Error,
 ) -> Value {
-    let error_code = if err.raw_os_error() == Some(32) {
-        "file_locked"
-    } else {
-        match err.kind() {
-            std::io::ErrorKind::PermissionDenied => "permission_denied",
-            std::io::ErrorKind::NotFound => "not_found",
-            std::io::ErrorKind::AlreadyExists => "already_exists",
-            std::io::ErrorKind::InvalidInput => "invalid_input",
-            _ => "io_error",
-        }
-    };
+    let error_code = super::file_io_error::classify(path, err, "not_found");
 
     json!({
         "success": false,
@@ -112,6 +114,23 @@ fn io_error_response(
         "io_kind": format!("{:?}", err.kind()),
         "os_error": err.raw_os_error()
     })
+}
+
+fn hash_mismatch_response(
+    path: &Path,
+    canonical: &Path,
+    expected_hash: &str,
+    actual_hash: Option<&str>,
+) -> Value {
+    let mut response = error_response(
+        path,
+        canonical,
+        "hash_mismatch",
+        "file contents changed since the expected SHA-256 digest was captured",
+    );
+    response["expected_hash"] = json!(expected_hash);
+    response["actual_hash"] = json!(actual_hash);
+    response
 }
 
 fn normalize_line_endings(
@@ -129,38 +148,46 @@ fn normalize_line_endings(
     }
 }
 
-fn encode_content(
-    content: &str,
-    target_encoding: &str,
-) -> std::result::Result<Vec<u8>, &'static str> {
-    match target_encoding {
-        "UTF-8" => Ok(content.as_bytes().to_vec()),
-        "WINDOWS-1252" => {
-            let (cow, _, has_unmappable) = encoding_rs::WINDOWS_1252.encode(content);
-            if has_unmappable {
-                return Err("content cannot be losslessly converted to Windows-1252");
-            }
-            Ok(cow.into_owned())
+fn detect_line_endings(content: &str) -> ExistingLineEndings {
+    let bytes = content.as_bytes();
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
         }
-        _ => Err("target_encoding must be UTF-8 or Windows-1252"),
+        if index > 0 && bytes[index - 1] == b'\r' {
+            crlf += 1;
+        } else {
+            lf += 1;
+        }
+    }
+
+    match (crlf > 0, lf > 0) {
+        (false, false) => ExistingLineEndings::None,
+        (false, true) => ExistingLineEndings::Lf,
+        (true, false) => ExistingLineEndings::Crlf,
+        (true, true) => ExistingLineEndings::Mixed,
     }
 }
 
-fn normalize_encoding_label(raw: &str) -> &'static str {
-    if raw.eq_ignore_ascii_case("windows-1252") {
-        "WINDOWS-1252"
-    } else {
-        "UTF-8"
-    }
+fn normalize_fragment_to_existing(fragment: &str, existing: ExistingLineEndings) -> (String, bool) {
+    let normalized = match existing {
+        ExistingLineEndings::Lf => fragment.replace("\r\n", "\n"),
+        ExistingLineEndings::Crlf => fragment.replace("\r\n", "\n").replace('\n', "\r\n"),
+        ExistingLineEndings::None | ExistingLineEndings::Mixed => fragment.to_string(),
+    };
+    let changed = normalized != fragment;
+    (normalized, changed)
 }
 
 fn line_ending_metadata(content: &str) -> Option<String> {
-    if content.contains("\r\n") {
-        Some("crlf".to_string())
-    } else if content.contains('\n') {
-        Some("lf".to_string())
-    } else {
-        None
+    match detect_line_endings(content) {
+        ExistingLineEndings::None => None,
+        ExistingLineEndings::Lf => Some("lf".to_string()),
+        ExistingLineEndings::Crlf => Some("crlf".to_string()),
+        ExistingLineEndings::Mixed => Some("mixed".to_string()),
     }
 }
 
@@ -181,16 +208,22 @@ pub async fn execute(args: &Value) -> Result<Value> {
         ));
     }
 
-    let path = crate::common::resolve_tool_path(path_str);
-    let (canonical_from_guard, tier, reason) = GUARD.check_path(&path);
-    if tier == Tier::Blocked {
-        return Ok(error_response(
-            &path,
-            &canonical_from_guard,
-            "path_blocked",
-            reason.unwrap_or_else(|| "path is blocked by server policy".to_string()),
-        ));
-    }
+    let path = crate::common::resolve_write_tool_path(path_str);
+    let canonical_from_guard = GUARD.check_path(&path);
+    let expected_hash = match args.get("expected_hash").and_then(Value::as_str) {
+        Some(raw) => match super::file_hash::normalize_expected_hash(raw) {
+            Ok(hash) => Some(hash),
+            Err(message) => {
+                return Ok(error_response(
+                    &path,
+                    &canonical_from_guard,
+                    "invalid_hash",
+                    message,
+                ));
+            }
+        },
+        None => None,
+    };
 
     let mode = args
         .get("mode")
@@ -267,7 +300,11 @@ pub async fn execute(args: &Value) -> Result<Value> {
             };
 
             let (decoded, detected_encoding) = decode_fuzzy(&bytes);
-            (decoded, bytes, Some(detected_encoding.to_string()))
+            let detected_encoding = TextEncoding::parse(detected_encoding)
+                .map(TextEncoding::canonical_name)
+                .unwrap_or(detected_encoding)
+                .to_string();
+            (decoded, bytes, Some(detected_encoding))
         } else {
             if !create_if_missing {
                 return Ok(error_response(
@@ -280,9 +317,28 @@ pub async fn execute(args: &Value) -> Result<Value> {
 
             (String::new(), Vec::new(), None)
         };
+    let sha256_before = existed_before.then(|| super::file_hash::sha256_bytes(&old_bytes));
+    if let Some(expected_hash) = expected_hash.as_deref()
+        && sha256_before.as_deref() != Some(expected_hash)
+    {
+        return Ok(hash_mismatch_response(
+            &path,
+            &canonical_from_guard,
+            expected_hash,
+            sha256_before.as_deref(),
+        ));
+    }
 
     let has_content = args.get("content").is_some();
     let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let target_line_ending = args
+        .get("target_line_ending")
+        .and_then(|v| v.as_str())
+        .unwrap_or("preserve")
+        .to_ascii_lowercase();
+    let existing_line_endings = detect_line_endings(&old_content);
+    let mixed_line_endings = existing_line_endings == ExistingLineEndings::Mixed;
+    let mut line_endings_normalized = false;
 
     let mut replacements_applied: usize = 0;
 
@@ -307,7 +363,15 @@ pub async fn execute(args: &Value) -> Result<Value> {
                     "content is required when mode=append",
                 ));
             }
-            format!("{}{}", old_content, content)
+            let appended = if target_line_ending == "preserve" {
+                let (normalized, changed) =
+                    normalize_fragment_to_existing(content, existing_line_endings);
+                line_endings_normalized |= changed;
+                normalized
+            } else {
+                content.to_string()
+            };
+            format!("{}{}", old_content, appended)
         }
         "prepend" => {
             if !has_content {
@@ -318,11 +382,19 @@ pub async fn execute(args: &Value) -> Result<Value> {
                     "content is required when mode=prepend",
                 ));
             }
-            format!("{}{}", content, old_content)
+            let prepended = if target_line_ending == "preserve" {
+                let (normalized, changed) =
+                    normalize_fragment_to_existing(content, existing_line_endings);
+                line_endings_normalized |= changed;
+                normalized
+            } else {
+                content.to_string()
+            };
+            format!("{}{}", prepended, old_content)
         }
         "find_replace" => {
-            let find = args.get("find").and_then(|v| v.as_str()).unwrap_or("");
-            if find.is_empty() {
+            let raw_find = args.get("find").and_then(|v| v.as_str()).unwrap_or("");
+            if raw_find.is_empty() {
                 return Ok(error_response(
                     &path,
                     &canonical_from_guard,
@@ -330,14 +402,19 @@ pub async fn execute(args: &Value) -> Result<Value> {
                     "find is required and cannot be empty when mode=find_replace",
                 ));
             }
-            let replace = args.get("replace").and_then(|v| v.as_str()).unwrap_or("");
+            let raw_replace = args.get("replace").and_then(|v| v.as_str()).unwrap_or("");
+            let (find, find_normalized) =
+                normalize_fragment_to_existing(raw_find, existing_line_endings);
+            let (replace, replace_normalized) =
+                normalize_fragment_to_existing(raw_replace, existing_line_endings);
+            line_endings_normalized |= find_normalized || replace_normalized;
             let replace_all = args
                 .get("replace_all")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
             if replace_all {
-                replacements_applied = old_content.matches(find).count();
+                replacements_applied = old_content.matches(&find).count();
                 if replacements_applied == 0 {
                     return Ok(error_response(
                         &path,
@@ -346,9 +423,9 @@ pub async fn execute(args: &Value) -> Result<Value> {
                         "find text was not found in the file",
                     ));
                 }
-                old_content.replace(find, replace)
+                old_content.replace(&find, &replace)
             } else {
-                if !old_content.contains(find) {
+                if !old_content.contains(&find) {
                     return Ok(error_response(
                         &path,
                         &canonical_from_guard,
@@ -357,7 +434,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
                     ));
                 }
                 replacements_applied = 1;
-                old_content.replacen(find, replace, 1)
+                old_content.replacen(&find, &replace, 1)
             }
         }
         _ => old_content.clone(),
@@ -385,13 +462,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
         }));
     }
 
-    let target_line_ending = args
-        .get("target_line_ending")
-        .and_then(|v| v.as_str())
-        .unwrap_or("preserve")
-        .to_ascii_lowercase();
-
-    new_content = match normalize_line_endings(&new_content, &target_line_ending) {
+    let normalized_content = match normalize_line_endings(&new_content, &target_line_ending) {
         Ok(v) => v,
         Err(msg) => {
             return Ok(error_response(
@@ -402,30 +473,32 @@ pub async fn execute(args: &Value) -> Result<Value> {
             ));
         }
     };
+    line_endings_normalized |= normalized_content != new_content;
+    new_content = normalized_content;
 
-    let requested_encoding = args
-        .get("target_encoding")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_ascii_uppercase());
-
-    let target_encoding = match requested_encoding {
-        Some(enc) if enc == "UTF-8" || enc == "WINDOWS-1252" => enc,
-        Some(_) => {
-            return Ok(error_response(
-                &path,
-                &canonical_from_guard,
-                "invalid_encoding",
-                "target_encoding must be UTF-8 or Windows-1252",
-            ));
-        }
-        None => previous_encoding
-            .as_deref()
-            .map(normalize_encoding_label)
-            .unwrap_or("UTF-8")
-            .to_string(),
+    let target_encoding = match args.get("target_encoding").and_then(Value::as_str) {
+        Some(raw) => match TextEncoding::parse(raw) {
+            Ok(encoding) => encoding,
+            Err(message) => {
+                return Ok(error_response(
+                    &path,
+                    &canonical_from_guard,
+                    "invalid_encoding",
+                    message,
+                ));
+            }
+        },
+        None => match previous_encoding.as_deref() {
+            Some(previous) => TextEncoding::parse(previous).unwrap_or(TextEncoding::Utf8),
+            None => TextEncoding::Utf8,
+        },
     };
+    let target_encoding_name = target_encoding.canonical_name().to_string();
+    let encoding_changed = previous_encoding
+        .as_deref()
+        .is_some_and(|previous| previous != target_encoding_name);
 
-    let final_bytes = match encode_content(&new_content, &target_encoding) {
+    let final_bytes = match target_encoding.encode(&new_content) {
         Ok(bytes) => bytes,
         Err(msg) => {
             return Ok(error_response(
@@ -438,6 +511,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
     };
 
     let changed = !existed_before || old_bytes != final_bytes;
+    let sha256_after = super::file_hash::sha256_bytes(&final_bytes);
     if !changed {
         let canonical_after = std::fs::canonicalize(&path).unwrap_or(canonical_from_guard);
         let mut response = json!({
@@ -452,12 +526,40 @@ pub async fn execute(args: &Value) -> Result<Value> {
             "bytes_before": old_bytes.len(),
             "bytes_written": old_bytes.len(),
             "previous_encoding": previous_encoding,
-            "target_encoding": target_encoding,
+            "target_encoding": target_encoding_name,
+            "encoding_changed": encoding_changed,
             "line_ending": target_line_ending,
+            "line_endings_normalized": line_endings_normalized,
+            "mixed_line_endings": mixed_line_endings,
+            "sha256_before": sha256_before,
+            "sha256_after": sha256_after,
             "message": "no content changes detected"
         });
         attach_history_metadata(&mut response, &no_history("no filesystem change"));
         return Ok(response);
+    }
+
+    if let Some(expected_hash) = expected_hash.as_deref() {
+        let current_hash = match super::file_hash::sha256_file(&path) {
+            Ok(hash) => Some(hash),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Ok(io_error_response(
+                    &path,
+                    &canonical_from_guard,
+                    "recheck expected hash",
+                    &error,
+                ));
+            }
+        };
+        if current_hash.as_deref() != Some(expected_hash) {
+            return Ok(hash_mismatch_response(
+                &path,
+                &canonical_from_guard,
+                expected_hash,
+                current_hash.as_deref(),
+            ));
+        }
     }
 
     if let Some(parent) = path.parent()
@@ -496,9 +598,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
     let before_snapshot = if existed_before {
         file_snapshot(
             old_bytes.clone(),
-            previous_encoding
-                .clone()
-                .map(|v| normalize_encoding_label(&v).to_string()),
+            previous_encoding.clone(),
             line_ending_metadata(&old_content),
         )
     } else {
@@ -506,7 +606,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
     };
     let after_snapshot = file_snapshot(
         final_bytes.clone(),
-        Some(target_encoding.clone()),
+        Some(target_encoding_name.clone()),
         line_ending_metadata(&new_content),
     );
     let history_outcome = record_change(
@@ -533,8 +633,13 @@ pub async fn execute(args: &Value) -> Result<Value> {
         "bytes_before": old_bytes.len(),
         "bytes_written": final_bytes.len(),
         "previous_encoding": previous_encoding,
-        "target_encoding": target_encoding,
+        "target_encoding": target_encoding_name,
+        "encoding_changed": encoding_changed,
         "line_ending": target_line_ending,
+        "line_endings_normalized": line_endings_normalized,
+        "mixed_line_endings": mixed_line_endings,
+        "sha256_before": sha256_before,
+        "sha256_after": sha256_after,
         "message": if existed_before { "file updated" } else { "file created and updated" }
     });
     attach_history_metadata(&mut response, &history_outcome);

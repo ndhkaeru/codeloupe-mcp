@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use glob::Pattern;
 use ignore::{WalkBuilder, WalkState};
 use serde_json::{Value, json};
 use std::cmp::Reverse;
@@ -11,11 +10,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task;
 
-use super::path_filters::{apply_walk_overrides, compile_patterns, parse_pattern_strings};
+use super::path_filters::{
+    Pattern, apply_walk_overrides, compile_patterns, configure_walk_filters, filtered_file_counts,
+    is_vcs_metadata_dir, matches_patterns, parse_pattern_strings, passes_patterns,
+};
 use crate::indexer::{is_path_index_available, visit_indexed_entries_under};
+use crate::limits::{
+    DEFAULT_WORKSPACE_LINE_COUNT_BYTES, MAX_SKIPPED_FILE_DETAILS, MAX_WORKSPACE_LINE_COUNT_BYTES,
+};
 
-const DEFAULT_MAX_LINE_COUNT_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_LINE_COUNT_BYTES_LIMIT: u64 = 20 * 1024 * 1024;
+const DEFAULT_MAX_LINE_COUNT_BYTES: u64 = DEFAULT_WORKSPACE_LINE_COUNT_BYTES;
+const MAX_LINE_COUNT_BYTES_LIMIT: u64 = MAX_WORKSPACE_LINE_COUNT_BYTES;
 const DEFAULT_MAX_FILES: usize = 100_000;
 const MAX_FILES_LIMIT: usize = 1_000_000;
 
@@ -30,8 +35,11 @@ pub fn schema() -> Value {
                 "path": { "type": "string", "description": "Directory to summarize. In large repos, run on candidate subsystems rather than only workspace root." },
                 "max_line_count_bytes": { "type": "integer", "description": "Maximum bytes per file to count lines from; lower values keep scans fast." },
                 "max_files": { "type": "integer", "description": "Maximum files to inspect before returning a partial result. Defaults to 100000." },
+                "include_ignored": { "type": "boolean", "description": "Include files ignored by .gitignore, .git/info/exclude, global gitignore, or .ignore files." },
+                "include_hidden": { "type": "boolean", "description": "Include hidden files and directories except VCS metadata directories such as .git, unless scoped directly." },
                 "includes": { "type": "array", "items": { "type": "string" }, "description": "Optional glob include filters, e.g. **/*.rs." },
-                "excludes": { "type": "array", "items": { "type": "string" }, "description": "Optional glob exclude filters for build/generated/vendor areas." }
+                "excludes": { "type": "array", "items": { "type": "string" }, "description": "Optional glob exclude filters for build/generated/vendor areas." },
+                "verbose": { "type": "boolean", "description": "Include scan, filtering, line-count, and index diagnostics. Incomplete or partial line counts include diagnostics automatically." }
             },
             "required": ["path"]
         }
@@ -129,6 +137,8 @@ fn execute_blocking(args: Value) -> Result<Value> {
     }
 
     let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let cancellation =
+        crate::cancellation::token_for_scan(&args, std::slice::from_ref(&canonical_path));
     let max_line_count_bytes = parse_u64_arg(
         &args,
         "max_line_count_bytes",
@@ -139,10 +149,22 @@ fn execute_blocking(args: Value) -> Result<Value> {
     let max_files = parse_usize_arg(&args, "max_files", DEFAULT_MAX_FILES, 1, MAX_FILES_LIMIT);
     let include_globs = parse_pattern_strings(args.get("includes"));
     let exclude_globs = parse_pattern_strings(args.get("excludes"));
+    let include_ignored = args
+        .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_hidden = args
+        .get("include_hidden")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let verbose = args
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let includes = Arc::new(compile_patterns(&include_globs)?);
     let excludes = Arc::new(compile_patterns(&exclude_globs)?);
 
-    if is_path_index_available(&canonical_path) {
+    if !include_ignored && !include_hidden && is_path_index_available(&canonical_path) {
         let indexed_stats = build_workspace_stats_from_index(
             path_str,
             &canonical_path,
@@ -150,6 +172,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
             max_files,
             includes.as_ref(),
             excludes.as_ref(),
+            cancellation.as_ref(),
         );
         if indexed_stats
             .get("indexed_entries_available")
@@ -157,25 +180,29 @@ fn execute_blocking(args: Value) -> Result<Value> {
             .unwrap_or(0)
             > 0
         {
-            return Ok(indexed_stats);
+            let indexed_stats = attach_excluded_file_counts(
+                indexed_stats,
+                &canonical_path,
+                include_ignored,
+                include_hidden,
+            );
+            return Ok(finalize_workspace_stats_response(indexed_stats, verbose));
         }
     }
 
     let walk_threads = crate::common::bounded_walk_threads();
     let mut walker = WalkBuilder::new(&path);
-    walker
-        .hidden(true)
-        .ignore(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .threads(walk_threads);
+    configure_walk_filters(&mut walker, include_ignored, include_hidden);
+    walker.threads(walk_threads);
     apply_walk_overrides(&mut walker, &canonical_path, &include_globs, &exclude_globs)?;
     let filter_root = canonical_path.clone();
     let filter_excludes = Arc::clone(&excludes);
     walker.filter_entry(move |entry| {
         if entry.path() == filter_root {
             return true;
+        }
+        if is_vcs_metadata_dir(entry.path(), &filter_root) {
+            return false;
         }
         if !entry
             .file_type()
@@ -204,6 +231,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
         let accumulators = Arc::clone(&accumulators);
         let inspected_files = Arc::clone(&inspected_files);
         let truncated = Arc::clone(&truncated);
+        let cancellation = cancellation.clone();
         let shard_index = next_shard.fetch_add(1, Ordering::Relaxed) % shard_count;
         let root = root_for_workers.clone();
 
@@ -218,6 +246,10 @@ fn execute_blocking(args: Value) -> Result<Value> {
             }
 
             let seen = inspected_files.fetch_add(1, Ordering::Relaxed);
+            let files_seen = seen.saturating_add(1);
+            if crate::cancellation::report_scan_progress(cancellation.as_ref(), files_seen) {
+                return WalkState::Quit;
+            }
             if seen >= max_files {
                 truncated.store(true, Ordering::Relaxed);
                 return WalkState::Quit;
@@ -252,15 +284,20 @@ fn execute_blocking(args: Value) -> Result<Value> {
                 Err(_) => return WalkState::Quit,
             };
             accumulator.record_matched_file(
-                normalize_path(entry.path()),
+                rel,
                 size,
                 lang,
                 line_count,
                 should_count,
+                max_line_count_bytes,
             );
             WalkState::Continue
         })
     });
+    crate::cancellation::finish_scan_progress(
+        cancellation.as_ref(),
+        inspected_files.load(Ordering::Relaxed),
+    );
 
     let mut stats = StatsAccumulator::default();
     for accumulator in accumulators.iter() {
@@ -291,15 +328,19 @@ fn execute_blocking(args: Value) -> Result<Value> {
     let largest_out: Vec<Value> = stats
         .largest_files
         .iter()
-        .map(|(p, s)| json!({ "path": p, "size": s }))
+        .map(|(p, s)| json!({ "path": p, "size_bytes": s }))
         .collect();
 
-    Ok(json!({
+    let line_count_skipped_large_files_omitted = stats
+        .line_count_skipped_large_count
+        .saturating_sub(stats.line_count_skipped_large_files.len());
+    let limit_reached = truncated.load(Ordering::Relaxed);
+    let response = json!({
         "path": normalize_path(&canonical_path),
         "input_path": path_str,
         "canonical_path": normalize_path(&canonical_path),
         "total_files": stats.total_files,
-        "files_seen": stats.files_seen,
+        "files_walked": stats.files_walked,
         "files_skipped_by_patterns": stats.files_skipped_by_patterns,
         "total_lines": stats.total_lines,
         "total_size_bytes": stats.total_size,
@@ -308,19 +349,53 @@ fn execute_blocking(args: Value) -> Result<Value> {
         "largest_files": largest_out,
         "line_counted_files": stats.line_counted_files,
         "line_count_skipped_files": stats.line_count_skipped_files,
+        "line_count_skipped_large_count": stats.line_count_skipped_large_count,
+        "line_count_skipped_large_files": stats.line_count_skipped_large_files,
+        "line_count_skipped_large_files_omitted": line_count_skipped_large_files_omitted,
         "max_line_count_bytes": max_line_count_bytes,
         "max_files": max_files,
-        "truncated": truncated.load(Ordering::Relaxed),
-        "limit_reason": if truncated.load(Ordering::Relaxed) { Some("max_files") } else { None },
+        "complete": !limit_reached,
+        "limit_reached": limit_reached,
+        "limit_reason": if limit_reached { Some("max_files") } else { None },
         "line_counts_complete": stats.line_count_skipped_files == 0,
         "search_strategy": "filesystem_walk",
         "metadata_index_used": false,
+        "include_ignored": include_ignored,
+        "include_hidden": include_hidden,
         "note": if stats.line_count_skipped_files > 0 {
             format!("Line counts skip files over {} bytes or extensions treated as non-text.", max_line_count_bytes)
         } else {
             String::new()
         }
-    }))
+    });
+    let response =
+        attach_excluded_file_counts(response, &canonical_path, include_ignored, include_hidden);
+    Ok(finalize_workspace_stats_response(response, verbose))
+}
+
+fn attach_excluded_file_counts(
+    mut response: Value,
+    canonical_path: &Path,
+    include_ignored: bool,
+    include_hidden: bool,
+) -> Value {
+    let counts = filtered_file_counts(
+        &[canonical_path.to_path_buf()],
+        include_ignored,
+        include_hidden,
+    );
+    if counts.ignored_files > 0 || counts.hidden_files > 0 || !counts.complete {
+        crate::common::insert_object_field(
+            &mut response,
+            "excluded_files",
+            json!({
+                "ignored": counts.ignored_files,
+                "hidden": counts.hidden_files,
+                "counts_complete": counts.complete
+            }),
+        );
+    }
+    response
 }
 
 fn build_workspace_stats_from_index(
@@ -330,22 +405,24 @@ fn build_workspace_stats_from_index(
     max_files: usize,
     includes: &[Pattern],
     excludes: &[Pattern],
+    cancellation: Option<&crate::cancellation::CancellationToken>,
 ) -> Value {
     let mut stats = StatsAccumulator::default();
     let mut truncated = false;
+    let mut scanned_files = 0usize;
 
     let indexed_entries_available = visit_indexed_entries_under(canonical_path, |entry| {
         if entry.is_dir {
             return true;
         }
+        scanned_files = scanned_files.saturating_add(1);
+        if crate::cancellation::report_scan_progress(cancellation, scanned_files) {
+            return false;
+        }
 
+        let relative = relative_path(&entry.path, canonical_path);
         if (!includes.is_empty() || !excludes.is_empty())
-            && !passes_patterns(
-                &entry.path,
-                &relative_path(&entry.path, canonical_path),
-                includes,
-                excludes,
-            )
+            && !passes_patterns(&entry.path, &relative, includes, excludes)
         {
             stats.record_skipped_file();
             return true;
@@ -364,15 +441,17 @@ fn build_workspace_stats_from_index(
             0
         };
         stats.record_matched_file(
-            normalize_path(&entry.path),
+            relative,
             entry.size,
             lang,
             line_count,
             should_count,
+            max_line_count_bytes,
         );
         true
     })
     .unwrap_or(0);
+    crate::cancellation::finish_scan_progress(cancellation, scanned_files);
 
     let mut languages_out = Vec::new();
     for (lang, file_count) in &stats.lang_files {
@@ -395,15 +474,18 @@ fn build_workspace_stats_from_index(
     let largest_out: Vec<Value> = stats
         .largest_files
         .iter()
-        .map(|(p, s)| json!({ "path": p, "size": s }))
+        .map(|(p, s)| json!({ "path": p, "size_bytes": s }))
         .collect();
 
+    let line_count_skipped_large_files_omitted = stats
+        .line_count_skipped_large_count
+        .saturating_sub(stats.line_count_skipped_large_files.len());
     json!({
         "path": normalize_path(canonical_path),
         "input_path": path_str,
         "canonical_path": normalize_path(canonical_path),
         "total_files": stats.total_files,
-        "files_seen": stats.files_seen,
+        "files_walked": stats.files_walked,
         "files_skipped_by_patterns": stats.files_skipped_by_patterns,
         "total_lines": stats.total_lines,
         "total_size_bytes": stats.total_size,
@@ -412,13 +494,19 @@ fn build_workspace_stats_from_index(
         "largest_files": largest_out,
         "line_counted_files": stats.line_counted_files,
         "line_count_skipped_files": stats.line_count_skipped_files,
+        "line_count_skipped_large_count": stats.line_count_skipped_large_count,
+        "line_count_skipped_large_files": stats.line_count_skipped_large_files,
+        "line_count_skipped_large_files_omitted": line_count_skipped_large_files_omitted,
         "max_line_count_bytes": max_line_count_bytes,
         "max_files": max_files,
-        "truncated": truncated,
+        "complete": !truncated,
+        "limit_reached": truncated,
         "limit_reason": if truncated { Some("max_files") } else { None },
         "line_counts_complete": stats.line_count_skipped_files == 0,
         "search_strategy": "lmdb_metadata",
         "metadata_index_used": true,
+        "include_ignored": false,
+        "include_hidden": false,
         "indexed_entries_available": indexed_entries_available,
         "note": if stats.line_count_skipped_files > 0 {
             format!("File counts, sizes, and language totals came from LMDB. Line counts skip files over {} bytes or extensions treated as non-text.", max_line_count_bytes)
@@ -428,13 +516,82 @@ fn build_workspace_stats_from_index(
     })
 }
 
+fn finalize_workspace_stats_response(mut response: Value, verbose: bool) -> Value {
+    let complete = response
+        .get("complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let line_counts_complete = response
+        .get("line_counts_complete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let filtered_files = response
+        .get("files_skipped_by_patterns")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let include_diagnostics = verbose || !complete || !line_counts_complete || filtered_files > 0;
+    let Some(object) = response.as_object_mut() else {
+        return response;
+    };
+
+    let mut diagnostics = serde_json::Map::new();
+    for key in [
+        "input_path",
+        "canonical_path",
+        "files_walked",
+        "files_skipped_by_patterns",
+        "max_files",
+        "metadata_index_used",
+        "include_ignored",
+        "include_hidden",
+        "indexed_entries_available",
+        "note",
+    ] {
+        if let Some(value) = object.remove(key)
+            && !value.is_null()
+            && !matches!(&value, Value::String(text) if text.is_empty())
+        {
+            diagnostics.insert(key.to_string(), value);
+        }
+    }
+
+    let mut line_counting = serde_json::Map::new();
+    for (source, target) in [
+        ("line_counted_files", "counted_files"),
+        ("line_count_skipped_files", "skipped_files"),
+        ("line_count_skipped_large_count", "skipped_large_count"),
+        ("line_count_skipped_large_files", "skipped_large_files"),
+        (
+            "line_count_skipped_large_files_omitted",
+            "skipped_large_files_omitted",
+        ),
+        ("max_line_count_bytes", "max_file_bytes"),
+    ] {
+        if let Some(value) = object.remove(source)
+            && !value.is_null()
+            && !matches!(&value, Value::Array(items) if items.is_empty())
+        {
+            line_counting.insert(target.to_string(), value);
+        }
+    }
+    if !line_counting.is_empty() {
+        diagnostics.insert("line_counting".to_string(), Value::Object(line_counting));
+    }
+    if include_diagnostics && !diagnostics.is_empty() {
+        object.insert("diagnostics".to_string(), Value::Object(diagnostics));
+    }
+    response
+}
+
 #[derive(Default)]
 struct StatsAccumulator {
     total_files: usize,
-    files_seen: usize,
+    files_walked: usize,
     files_skipped_by_patterns: usize,
     line_counted_files: usize,
     line_count_skipped_files: usize,
+    line_count_skipped_large_count: usize,
+    line_count_skipped_large_files: Vec<Value>,
     total_size: u64,
     total_lines: u64,
     lang_files: HashMap<&'static str, usize>,
@@ -445,7 +602,7 @@ struct StatsAccumulator {
 
 impl StatsAccumulator {
     fn record_skipped_file(&mut self) {
-        self.files_seen += 1;
+        self.files_walked += 1;
         self.files_skipped_by_patterns += 1;
     }
 
@@ -456,8 +613,9 @@ impl StatsAccumulator {
         lang: &'static str,
         line_count: u64,
         line_counted: bool,
+        max_line_count_bytes: u64,
     ) {
-        self.files_seen += 1;
+        self.files_walked += 1;
         self.total_files += 1;
         self.total_size += size;
         self.total_lines += line_count;
@@ -466,6 +624,16 @@ impl StatsAccumulator {
             self.line_counted_files += 1;
         } else {
             self.line_count_skipped_files += 1;
+            if lang != "Other" && size > max_line_count_bytes {
+                self.line_count_skipped_large_count += 1;
+                if self.line_count_skipped_large_files.len() < MAX_SKIPPED_FILE_DETAILS {
+                    self.line_count_skipped_large_files.push(json!({
+                        "path": path,
+                        "size_bytes": size,
+                        "limit_bytes": max_line_count_bytes
+                    }));
+                }
+            }
         }
 
         *self.lang_files.entry(lang).or_insert(0) += 1;
@@ -476,10 +644,11 @@ impl StatsAccumulator {
 
     fn merge(&mut self, mut other: Self) {
         self.total_files += other.total_files;
-        self.files_seen += other.files_seen;
+        self.files_walked += other.files_walked;
         self.files_skipped_by_patterns += other.files_skipped_by_patterns;
         self.line_counted_files += other.line_counted_files;
         self.line_count_skipped_files += other.line_count_skipped_files;
+        self.line_count_skipped_large_count += other.line_count_skipped_large_count;
         self.total_size += other.total_size;
         self.total_lines += other.total_lines;
 
@@ -492,6 +661,11 @@ impl StatsAccumulator {
         for (lang, lines) in other.lang_lines {
             *self.lang_lines.entry(lang).or_insert(0) += lines;
         }
+
+        self.line_count_skipped_large_files
+            .append(&mut other.line_count_skipped_large_files);
+        self.line_count_skipped_large_files
+            .truncate(MAX_SKIPPED_FILE_DETAILS);
 
         self.largest_files.append(&mut other.largest_files);
         self.largest_files.sort_by_key(|file| Reverse(file.1));
@@ -528,39 +702,6 @@ fn parse_u64_arg(args: &Value, name: &str, default: u64, min: u64, max: u64) -> 
         .and_then(|value| value.as_u64())
         .unwrap_or(default)
         .clamp(min, max)
-}
-
-fn passes_patterns(
-    path: &Path,
-    relative_path: &str,
-    includes: &[Pattern],
-    excludes: &[Pattern],
-) -> bool {
-    if !includes.is_empty() && !matches_patterns(path, relative_path, includes) {
-        return false;
-    }
-
-    if matches_patterns(path, relative_path, excludes) {
-        return false;
-    }
-
-    true
-}
-
-fn matches_patterns(path: &Path, relative_path: &str, patterns: &[Pattern]) -> bool {
-    if patterns.is_empty() {
-        return false;
-    }
-
-    let full_path = normalize_path(path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let values = [relative_path, full_path.as_str(), file_name];
-    patterns
-        .iter()
-        .any(|pattern| values.iter().any(|value| pattern.matches(value)))
 }
 
 fn relative_path(path: &Path, root: &Path) -> String {

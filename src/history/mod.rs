@@ -9,6 +9,7 @@ use crate::common::ensure_object;
 use crate::tools::read_file::decode_fuzzy;
 
 const MAX_HISTORY_ENTRIES: usize = 200;
+pub const MAX_HISTORY_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_TRACKED_SNAPSHOT_BYTES: usize = 10 * 1024 * 1024;
 
 lazy_static! {
@@ -34,17 +35,19 @@ pub struct PathSnapshot {
 struct HistoryState {
     records: Vec<HistoryRecord>,
     next_entry_id: u64,
+    retained_bytes: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
-struct HistoryRecord {
-    entry_id: String,
-    tool_name: String,
-    path: String,
-    before: PathSnapshot,
-    after: PathSnapshot,
-    summary: String,
+pub struct HistoryRecord {
+    pub entry_id: String,
+    pub tool_name: String,
+    pub path: String,
+    pub canonical_path: String,
+    pub before: PathSnapshot,
+    pub after: PathSnapshot,
+    pub summary: String,
+    pub outside_declared: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -109,14 +112,17 @@ pub fn capture_snapshot(path: &Path) -> Result<PathSnapshot, String> {
 }
 
 fn infer_text_metadata(bytes: &[u8]) -> (Option<String>, Option<String>) {
-    let (_, encoding) = decode_fuzzy(bytes);
-    let text = String::from_utf8_lossy(bytes);
-    let line_ending = if text.contains("\r\n") {
-        Some("crlf".to_string())
-    } else if text.contains('\n') {
-        Some("lf".to_string())
-    } else {
-        None
+    let (text, encoding) = decode_fuzzy(bytes);
+    let has_crlf = text.contains("\r\n");
+    let has_lf =
+        text.as_bytes().iter().enumerate().any(|(index, byte)| {
+            *byte == b'\n' && (index == 0 || text.as_bytes()[index - 1] != b'\r')
+        });
+    let line_ending = match (has_crlf, has_lf) {
+        (false, false) => None,
+        (false, true) => Some("lf".to_string()),
+        (true, false) => Some("crlf".to_string()),
+        (true, true) => Some("mixed".to_string()),
     };
 
     (
@@ -166,19 +172,21 @@ pub fn record_change(
     let entry_id = format!("h{}", guard.next_entry_id);
     guard.next_entry_id += 1;
 
-    guard.records.push(HistoryRecord {
+    let record = HistoryRecord {
         entry_id: entry_id.clone(),
         tool_name: tool_name.to_string(),
         path: path.to_string_lossy().to_string(),
+        canonical_path: crate::common::canonicalize_with_existing_ancestor(path)
+            .to_string_lossy()
+            .to_string(),
         before,
         after,
         summary: summary.into(),
-    });
-
-    if guard.records.len() > MAX_HISTORY_ENTRIES {
-        let overflow = guard.records.len() - MAX_HISTORY_ENTRIES;
-        guard.records.drain(0..overflow);
-    }
+        outside_declared: crate::security::path_guard::GUARD
+            .classify_path(path)
+            .outside_declared,
+    };
+    guard.push_record(record, MAX_HISTORY_ENTRIES, MAX_HISTORY_BYTES);
 
     RecordOutcome {
         recorded: true,
@@ -216,38 +224,67 @@ pub fn no_history(reason: impl Into<String>) -> RecordOutcome {
     }
 }
 
-#[allow(dead_code)]
-fn retained_history_bytes() -> usize {
+fn snapshot_bytes(snapshot: &PathSnapshot) -> usize {
+    snapshot.bytes.as_ref().map(Vec::len).unwrap_or(0)
+}
+
+fn record_bytes(record: &HistoryRecord) -> usize {
+    snapshot_bytes(&record.before) + snapshot_bytes(&record.after)
+}
+
+impl HistoryState {
+    fn push_record(&mut self, record: HistoryRecord, max_entries: usize, max_bytes: usize) {
+        self.retained_bytes = self.retained_bytes.saturating_add(record_bytes(&record));
+        self.records.push(record);
+        while self.records.len() > max_entries || self.retained_bytes > max_bytes {
+            if self.records.is_empty() {
+                self.retained_bytes = 0;
+                break;
+            }
+            let removed = self.records.remove(0);
+            self.retained_bytes = self.retained_bytes.saturating_sub(record_bytes(&removed));
+        }
+    }
+}
+
+pub fn retained_history_bytes() -> usize {
     HISTORY_STATE
         .lock()
-        .map(|guard| {
-            guard
-                .records
-                .iter()
-                .map(|record| {
-                    record
-                        .before
-                        .bytes
-                        .as_ref()
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(0)
-                        + record
-                            .after
-                            .bytes
-                            .as_ref()
-                            .map(|bytes| bytes.len())
-                            .unwrap_or(0)
-                })
-                .sum()
-        })
+        .map(|guard| guard.retained_bytes)
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
+pub fn list_records(limit: usize) -> (Vec<HistoryRecord>, usize) {
+    HISTORY_STATE
+        .lock()
+        .map(|guard| {
+            (
+                guard.records.iter().rev().take(limit).cloned().collect(),
+                guard.records.len(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+pub fn get_record(entry_id: &str) -> Option<HistoryRecord> {
+    HISTORY_STATE.lock().ok().and_then(|guard| {
+        guard
+            .records
+            .iter()
+            .find(|record| record.entry_id == entry_id)
+            .cloned()
+    })
+}
+
+pub fn snapshots_match_contents(left: &PathSnapshot, right: &PathSnapshot) -> bool {
+    left.state == right.state && left.bytes == right.bytes
+}
+
 pub fn clear_history() {
     if let Ok(mut guard) = HISTORY_STATE.lock() {
         guard.records.clear();
         guard.next_entry_id = 0;
+        guard.retained_bytes = 0;
     }
 }
 
@@ -296,5 +333,31 @@ mod tests {
         );
         assert!(!outcome.recorded);
         assert!(outcome.reason.unwrap().contains("history snapshot limit"));
+    }
+
+    #[test]
+    fn history_state_evicts_oldest_records_by_byte_budget() {
+        let _guard = history_test_guard();
+        let mut state = HistoryState::default();
+        for index in 0..3 {
+            state.push_record(
+                HistoryRecord {
+                    entry_id: format!("h{index}"),
+                    tool_name: "test".to_string(),
+                    path: format!("file-{index}.txt"),
+                    canonical_path: format!("file-{index}.txt"),
+                    before: file_snapshot(vec![b'a'; 4], None, None),
+                    after: file_snapshot(vec![b'b'; 4], None, None),
+                    summary: "test".to_string(),
+                    outside_declared: false,
+                },
+                10,
+                16,
+            );
+        }
+
+        assert_eq!(state.retained_bytes, 16);
+        assert_eq!(state.records.len(), 2);
+        assert_eq!(state.records[0].entry_id, "h1");
     }
 }
