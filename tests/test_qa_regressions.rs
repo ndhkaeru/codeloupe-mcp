@@ -799,9 +799,9 @@ fn file_uri_for_test(path: &Path) -> String {
 }
 
 fn canonical_display_path(path: &Path) -> String {
-    codeloupe_mcp::common::normalize_display_path(&codeloupe_mcp::common::canonicalize_if_exists(
-        path.to_path_buf(),
-    ))
+    codeloupe_mcp::common::normalize_display_path(
+        &codeloupe_mcp::common::canonicalize_with_existing_ancestor(path),
+    )
 }
 
 fn create_directory_link(link: &Path, target: &Path) {

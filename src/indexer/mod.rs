@@ -898,7 +898,7 @@ pub fn ensure_workspace_index(workspace_root: PathBuf, workspace_source: String)
     }
     set_active_workspace(&workspace_key);
 
-    let first_seen = ensure_runtime_loaded(&workspace_key, &workspace_root, &workspace_source);
+    ensure_runtime_loaded(&workspace_key, &workspace_root, &workspace_source);
     record_request_source(&workspace_key, &workspace_source);
     let storage_dir = index_storage_dir_for_workspace(&workspace_root);
     if storage_dir.is_dir()
@@ -913,7 +913,7 @@ pub fn ensure_workspace_index(workspace_root: PathBuf, workspace_source: String)
 
     let now = current_unix_timestamp();
     let should_refresh = match INDEX_RUNTIMES.read() {
-        Ok(guard) => guard.get(&workspace_key).is_none_or(|state| {
+        Ok(guard) => guard.get(&workspace_key).is_some_and(|state| {
             if state.refresh_running {
                 return false;
             }
@@ -925,7 +925,7 @@ pub fn ensure_workspace_index(workspace_root: PathBuf, workspace_source: String)
                 .map(|timestamp| now.saturating_sub(timestamp) >= stale_index_after_secs())
                 .unwrap_or(true)
         }),
-        Err(_) => first_seen,
+        Err(_) => false,
     };
 
     if should_refresh && refresh_interval_elapsed(&workspace_key, now) {
@@ -1360,6 +1360,9 @@ fn load_existing_json_index(
 }
 
 fn spawn_full_metadata_refresh(workspace_root: PathBuf, workspace_key: String) {
+    if DISABLED_WORKSPACES.contains_key(&workspace_key) {
+        return;
+    }
     if ACTIVE_REFRESHES.insert(workspace_key.clone(), ()).is_some() {
         return;
     }
