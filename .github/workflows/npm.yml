@@ -56,6 +56,7 @@ jobs:
             echo "package version ${package_version} does not match release tag ${RELEASE_TAG}" >&2
             exit 1
           fi
+          (cd packages/npm && npm run test:layout)
 
       - name: Validate MCP registry metadata
         if: env.HAS_NPM_TOKEN == 'true'
@@ -90,8 +91,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          query='(["codeloupe-mcp-aarch64-apple-darwin.tar.xz", "codeloupe-mcp-aarch64-pc-windows-msvc.zip", "codeloupe-mcp-aarch64-unknown-linux-gnu.tar.xz", "codeloupe-mcp-x86_64-apple-darwin.tar.xz", "codeloupe-mcp-x86_64-pc-windows-msvc.zip", "codeloupe-mcp-x86_64-unknown-linux-gnu.tar.xz"] as $required | [.assets[].name] as $names | all($required[]; . as $asset | $names | index($asset)))'
-          for i in {1..45}; do
+          query='(["codeloupe-mcp-aarch64-apple-darwin.tar.xz", "codeloupe-mcp-aarch64-pc-windows-msvc.zip", "codeloupe-mcp-aarch64-unknown-linux-musl.tar.xz", "codeloupe-mcp-x86_64-apple-darwin.tar.xz", "codeloupe-mcp-x86_64-pc-windows-msvc.zip", "codeloupe-mcp-x86_64-unknown-linux-musl.tar.xz"] as $required | [.assets[].name] as $names | all($required[]; . as $asset | $names | index($asset)))'
+          for i in {1..90}; do
             if gh release view "${RELEASE_TAG}" --json assets --jq "${query}" | grep -q true; then
               exit 0
             fi
@@ -110,12 +111,42 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: npm run prepare:native
 
-      - name: Publish npm package
+      - name: Smoke test packed npm install
+        if: env.HAS_NPM_TOKEN == 'true'
+        working-directory: packages/npm
+        run: npm run test:packed
+
+      - name: Publish platform npm packages
+        if: env.HAS_NPM_TOKEN == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for package_dir in packages/npm-platforms/*; do
+            if [ ! -f "${package_dir}/package.json" ]; then
+              continue
+            fi
+            package_name="$(node -p "require('./${package_dir}/package.json').name")"
+            package_version="$(node -p "require('./${package_dir}/package.json').version")"
+            if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+              echo "${package_name}@${package_version} is already published; skipping"
+            else
+              npm publish "${package_dir}" --access public
+            fi
+          done
+
+      - name: Publish launcher npm package
         if: env.HAS_NPM_TOKEN == 'true'
         working-directory: packages/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish
+        run: |
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+          if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+            echo "${package_name}@${package_version} is already published; skipping"
+          else
+            npm publish
+          fi
 
   publish-registry:
     name: Publish MCP Registry metadata

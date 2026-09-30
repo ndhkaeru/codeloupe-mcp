@@ -115,6 +115,11 @@ jobs:
         run: |
           node --check packages/npm/bin/codeloupe-mcp.js
           node --check packages/npm/scripts/prepare-npm-assets.js
+          node --check packages/npm/scripts/smoke.js
+          node --check packages/npm/scripts/test-package-layout.js
+          node --check packages/npm/scripts/test-launcher-resolution.js
+          node --check packages/npm/scripts/test-packed-install.js
+          (cd packages/npm && npm run test:env && npm run test:layout)
 
       - name: Validate MCP registry metadata
         run: |

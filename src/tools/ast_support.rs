@@ -485,34 +485,34 @@ pub fn child_field_text<'a>(node: &Node<'a>, field: &str, source: &'a [u8]) -> O
 }
 
 pub fn declaration_name<'a>(node: &Node<'a>, source: &'a [u8]) -> Option<&'a str> {
-    child_field_text(node, "name", source)
-        .or_else(|| child_field_text(node, "function", source))
-        .or_else(|| child_field_text(node, "method", source))
+    declaration_name_node(node).and_then(|name| node_text(name, source))
+}
+
+fn declaration_name_node<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    node.child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("function"))
+        .or_else(|| node.child_by_field_name("method"))
         .or_else(|| {
             node.child_by_field_name("declarator")
-                .and_then(|declarator| declarator_name(declarator, source))
+                .and_then(declarator_name_node)
         })
-        .or_else(|| first_identifier_child(node, source))
+        .or_else(|| first_identifier_child_node(node))
 }
 
-fn first_identifier_child<'a>(node: &Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+fn first_identifier_child_node<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if is_identifier_like_node(child.kind()) {
-            return node_text(child, source);
-        }
-    }
-    None
+    node.named_children(&mut cursor)
+        .find(|child| is_identifier_like_node(child.kind()))
 }
 
-fn declarator_name<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+fn declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
     if is_identifier_like_node(node.kind()) {
-        return node_text(node, source);
+        return Some(node);
     }
 
     for field in ["declarator", "name", "function", "method"] {
         if let Some(field_node) = node.child_by_field_name(field)
-            && let Some(name) = declarator_name(field_node, source)
+            && let Some(name) = declarator_name_node(field_node)
         {
             return Some(name);
         }
@@ -520,7 +520,7 @@ fn declarator_name<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if let Some(name) = declarator_name(child, source) {
+        if let Some(name) = declarator_name_node(child) {
             return Some(name);
         }
     }
@@ -767,6 +767,35 @@ pub fn classify_reference_match(root: Node<'_>, byte_offset: usize) -> &'static 
         node = parent;
     }
     "code"
+}
+
+pub fn is_symbol_definition_match(
+    root: Node<'_>,
+    source: &[u8],
+    symbol: &str,
+    byte_offset: usize,
+) -> bool {
+    if byte_offset >= root.end_byte() {
+        return false;
+    }
+    let end_byte = (byte_offset + 1).min(root.end_byte());
+    let Some(mut node) = root.descendant_for_byte_range(byte_offset, end_byte) else {
+        return false;
+    };
+    loop {
+        if is_symbol_node(node.kind())
+            && let Some(name_node) = declaration_name_node(&node)
+            && byte_offset >= name_node.start_byte()
+            && byte_offset < name_node.end_byte()
+            && node_text(name_node, source).is_some_and(|name| symbol_query_matches(symbol, name))
+        {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
 }
 
 pub fn collect_symbols(root: Node<'_>, source: &[u8]) -> Vec<Value> {

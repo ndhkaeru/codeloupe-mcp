@@ -13,7 +13,7 @@ use version::SERVER_VERSION;
 
 const SERVER_NAME: &str = "codeloupe-mcp";
 const SERVER_INSTRUCTIONS: &str = "Use codeloupe-mcp when you need local repository context without loading whole files or trees. Start with search_workspace for an unfamiliar query when path, symbol, and exact text evidence are all useful; inspect each group's source, status, strategy, and completeness instead of treating the facade as heuristic routing. Use project_map, workspace_stats, fuzzy_find, or compare_directories when you need one focused view of scope; use server_health to check workspace candidates and path/content index status in large repos; warm scoped content zones before repeated literal searches; then use text_search with the narrowest paths/includes possible and read_file_range, read_snippets, or read_symbol_body for focused evidence. Prefer symbol tools for definitions, references, imports/exports, and call graphs before editing. Prefer literal text_search so the content index can shortlist files; inspect search_strategy, fallback_reason, content_index_used, content_index_partial, content_index_zones, zone_indexed_at, index_age_secs, warming_zones, and unindexed_files_in_scope. If index_advice recommends indexing and repeated searches are expected, call workspace_index(action=\"enable\"); do not enable unrelated paths, and decline with workspace_index(action=\"disable\") when indexing is not needed. A too_large or blocked recommendation cannot be overridden by the agent. An approval_required recommendation may be enabled only when the user explicitly requested work at that exact path; scan and disk budgets still apply. Avoid workspace-root searches in large repos unless allow_expensive_fallback=true is intentional. Use file_hash or read_file_range sha256 values as expected_hash preconditions when edits must not overwrite concurrent changes, and use validate_json for streaming JSON syntax checks. For edits, use create_file/create_directory/edit_file/delete_file with exact paths and verify with focused reads or tests. Paths should be absolute or workspace-relative to the active workspace context.";
-const WRITE_AUTH_INSTRUCTIONS: &str = "workspace_index controls indexing only and does not declare a write root. Write tools do not block paths by policy; they attach low, medium, high, or critical risk warnings based on location. Filesystem permissions and normal operation preconditions still apply.";
+const WRITE_AUTH_INSTRUCTIONS: &str = "workspace_index controls indexing only and does not declare a write root. Write tools attach risk warnings based on location. Low, medium, and high risks proceed immediately; critical-risk writes perform no filesystem mutation until the call is retried with acknowledge_risk=true. Filesystem permissions and normal operation preconditions still apply.";
 /// Default timeout for one tool call (seconds).
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 60;
 /// Maximum timeout a client can request for one tool call (seconds).
@@ -46,8 +46,21 @@ struct MessageReadError {
     recoverable: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliAction {
+    Help,
+    Version,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(action) = cli_action_from_args()? {
+        match action {
+            CliAction::Help => print_cli_help(),
+            CliAction::Version => println!("{SERVER_NAME} {SERVER_VERSION}"),
+        }
+        return Ok(());
+    }
     let log_level = Level::INFO;
 
     tracing_subscriber::fmt()
@@ -345,6 +358,47 @@ async fn main() -> anyhow::Result<()> {
 
     info!(total_requests = request_count, "Server shutdown");
     Ok(())
+}
+
+fn cli_action_from_args() -> anyhow::Result<Option<CliAction>> {
+    let mut action = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(argument) = args.next() {
+        let rendered = argument.to_string_lossy();
+        match rendered.as_ref() {
+            "-h" | "--help" => set_cli_action(&mut action, CliAction::Help)?,
+            "-V" | "--version" => set_cli_action(&mut action, CliAction::Version)?,
+            "--workspace" => {
+                if args.next().is_none() {
+                    return Err(anyhow::anyhow!("--workspace requires a path"));
+                }
+            }
+            value if value.starts_with("--workspace=") => {
+                if value.trim_start_matches("--workspace=").is_empty() {
+                    return Err(anyhow::anyhow!("--workspace requires a path"));
+                }
+            }
+            value if value.starts_with('-') => {
+                return Err(anyhow::anyhow!("Unknown option: {value}"));
+            }
+            value => return Err(anyhow::anyhow!("Unexpected positional argument: {value}")),
+        }
+    }
+    Ok(action)
+}
+
+fn set_cli_action(current: &mut Option<CliAction>, action: CliAction) -> anyhow::Result<()> {
+    if current.is_some_and(|existing| existing != action) {
+        return Err(anyhow::anyhow!("--help and --version cannot be combined"));
+    }
+    *current = Some(action);
+    Ok(())
+}
+
+fn print_cli_help() {
+    println!(
+        "{SERVER_NAME} {SERVER_VERSION}\n\nUsage: {SERVER_NAME} [OPTIONS]\n\nOptions:\n      --workspace <PATH>  Register an explicit workspace; repeatable\n  -h, --help              Print help and exit\n  -V, --version           Print version and exit"
+    );
 }
 
 struct QueuedMessage {

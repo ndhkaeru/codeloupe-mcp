@@ -1,0 +1,12 @@
+{
+  "name": "@ndhkaeru/codeloupe-mcp-linux-x64",
+  "version": "1.1.0",
+  "description": "Static codeloupe-mcp binary for Linux x64",
+  "license": "Apache-2.0",
+  "repository": "github:ndhkaeru/codeloupe-mcp",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["bin/", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public" }
+}

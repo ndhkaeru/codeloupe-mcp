@@ -497,7 +497,7 @@ pub fn write_workspace_scope_for_lexical_path(path: &Path) -> Option<WriteWorksp
 
 pub fn write_session_snapshot() -> WriteSessionSnapshot {
     WriteSessionSnapshot {
-        write_scope: "warning_only",
+        write_scope: "risk_aware",
         elicitation_supported: false,
         approved_directories: Vec::new(),
         declined_directories: Vec::new(),

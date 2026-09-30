@@ -593,6 +593,17 @@ async fn test_find_references_classifies_code_comments_and_strings_with_ast() {
         })
         .collect::<Vec<_>>();
     assert_eq!(kinds, vec!["code", "code", "string", "comment"]);
+    assert_eq!(
+        references[0]
+            .get("is_definition")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert!(
+        references[1..]
+            .iter()
+            .all(|reference| reference.get("is_definition").is_none())
+    );
     assert!(
         references
             .iter()

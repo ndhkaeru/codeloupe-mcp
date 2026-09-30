@@ -460,6 +460,31 @@ async fn test_read_file_tail_and_byte_ranges_are_bounded_and_resumable() {
 
     let long_path = dir.path().join("long-line.txt");
     std::fs::write(&long_path, "x".repeat(2 * 1024 * 1024)).unwrap();
+    let default_line_range = read_file::execute(&json!({
+        "path": long_path.to_str().unwrap()
+    }))
+    .await
+    .unwrap();
+    assert_eq!(
+        default_line_range
+            .get("content")
+            .and_then(|value| value.as_str())
+            .map(str::len),
+        Some(64 * 1024)
+    );
+    assert_eq!(
+        default_line_range
+            .get("line_truncated")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        default_line_range
+            .get("next_start_byte")
+            .and_then(|value| value.as_u64()),
+        Some(64 * 1024)
+    );
+
     let line_range = read_file::execute(&json!({
         "path": long_path.to_str().unwrap(),
         "max_bytes": 16
@@ -483,6 +508,33 @@ async fn test_read_file_tail_and_byte_ranges_are_bounded_and_resumable() {
         Some(16)
     );
     assert!(line_range.get("next_start_line").is_none());
+
+    let too_small_for_line_number = read_file::execute(&json!({
+        "path": long_path.to_str().unwrap(),
+        "max_bytes": 2,
+        "include_line_numbers": true
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        too_small_for_line_number
+            .to_string()
+            .contains("too small to return any complete UTF-8 content")
+    );
+
+    let unicode_path = dir.path().join("unicode-line.txt");
+    std::fs::write(&unicode_path, "ééé").unwrap();
+    let too_small_for_utf8 = read_file::execute(&json!({
+        "path": unicode_path.to_str().unwrap(),
+        "max_bytes": 1
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        too_small_for_utf8
+            .to_string()
+            .contains("too small to return any complete UTF-8 content")
+    );
 
     let line_snippets = read_snippets::execute(&json!({
         "requests": [{

@@ -19,6 +19,9 @@ pnpm-debug.log*
 # Release/package outputs
 /dist/
 /packages/npm/native/
+/packages/npm-platforms/*/bin/
+/packages/npm-platforms/*/LICENSE
+/packages/npm-platforms/*/README.md
 *.tgz
 
 # Local environment and editor state

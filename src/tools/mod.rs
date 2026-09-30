@@ -58,7 +58,7 @@ pub fn list_tools() -> Vec<Value> {
 }
 
 fn full_tool_schemas() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         resolve_path::schema(),
         search_workspace::schema(),
         text_search::schema(),
@@ -95,7 +95,33 @@ fn full_tool_schemas() -> Vec<Value> {
         get_call_graph::schema(),
         batch_tool_call::schema(),
         undo_change::schema(),
-    ]
+    ];
+    for tool in &mut tools {
+        add_write_risk_acknowledgement_schema(tool);
+    }
+    tools
+}
+
+fn add_write_risk_acknowledgement_schema(tool: &mut Value) {
+    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    if !is_write_tool(name) {
+        return;
+    }
+    let Some(properties) = tool
+        .pointer_mut("/inputSchema/properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    properties.insert(
+        "acknowledge_risk".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Required on a retry before a critical-risk write is allowed. The first unacknowledged call performs no filesystem mutation."
+        }),
+    );
 }
 
 fn compact_public_schema(mut tool: Value) -> Value {
@@ -146,28 +172,77 @@ pub async fn call_tool_with_cancellation(
     .map_err(|err| anyhow::anyhow!("tool worker failed to join: {err}"))?
 }
 
-fn write_target_warnings(tool_name: &str, arguments: &Value) -> Vec<String> {
+#[derive(Debug)]
+struct WriteTarget {
+    path: PathBuf,
+    acknowledged: bool,
+}
+
+#[derive(Default)]
+struct WritePreflight {
+    warnings: Vec<String>,
+    critical_paths: Vec<PathBuf>,
+    confirmation_error: Option<Value>,
+}
+
+fn preflight_write_targets(tool_name: &str, arguments: &Value) -> WritePreflight {
     let mut raw_targets = Vec::new();
     collect_write_targets(tool_name, arguments, &mut raw_targets);
     let mut warnings = BTreeMap::<String, String>::new();
-    for (path, _) in raw_targets {
-        let classification = crate::security::path_guard::GUARD.classify_path(&path);
-        if let Some(warning) = classification.warning {
-            warnings
-                .entry(crate::common::normalize_display_path(
-                    &classification.canonical,
-                ))
-                .or_insert(warning);
+    let mut unacknowledged_critical = Vec::new();
+    let mut critical_paths = Vec::new();
+    for target in raw_targets {
+        let classification = crate::security::path_guard::GUARD.classify_path(&target.path);
+        let canonical_display = crate::common::normalize_display_path(&classification.canonical);
+        if let Some(warning) = classification.warning.clone() {
+            warnings.entry(canonical_display).or_insert(warning);
+        }
+        if classification.tier == crate::security::path_guard::Tier::CriticalRiskWarn {
+            critical_paths.push(classification.canonical.clone());
+            if !target.acknowledged {
+                unacknowledged_critical.push((target.path, classification.canonical));
+            }
         }
     }
-    warnings.into_values().collect()
+    let warnings = warnings.into_values().collect::<Vec<_>>();
+    let confirmation_error = unacknowledged_critical.first().map(|(path, canonical)| {
+        let display_path = crate::common::normalize_display_path(path);
+        let canonical_path = crate::common::normalize_display_path(canonical);
+        let mut response = json!({
+            "__mcp_is_error": true,
+            "error": {
+                "code": "risk_confirmation_required",
+                "message": "Critical write risk requires confirmation before any filesystem mutation. Review the warning and retry with acknowledge_risk=true."
+            },
+            "path": display_path,
+        });
+        if display_path != canonical_path {
+            response["canonical_path"] = json!(canonical_path);
+        }
+        if unacknowledged_critical.len() > 1 {
+            response["critical_paths"] = json!(unacknowledged_critical
+                .iter()
+                .map(|(_, canonical)| crate::common::normalize_display_path(canonical))
+                .collect::<Vec<_>>());
+        }
+        response
+    });
+    WritePreflight {
+        warnings,
+        critical_paths,
+        confirmation_error,
+    }
 }
 
-fn collect_write_targets(tool_name: &str, arguments: &Value, targets: &mut Vec<(PathBuf, bool)>) {
+fn collect_write_targets(tool_name: &str, arguments: &Value, targets: &mut Vec<WriteTarget>) {
+    let acknowledged = arguments
+        .get("acknowledge_risk")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     match tool_name {
-        "create_directory" => push_write_path(arguments, "path", true, targets),
+        "create_directory" => push_write_path(arguments, "path", acknowledged, targets),
         "create_file" | "delete_file" | "edit_file" | "convert_file_format" => {
-            push_write_path(arguments, "path", false, targets)
+            push_write_path(arguments, "path", acknowledged, targets)
         }
         "edit_files" => {
             for file in arguments
@@ -176,7 +251,7 @@ fn collect_write_targets(tool_name: &str, arguments: &Value, targets: &mut Vec<(
                 .into_iter()
                 .flatten()
             {
-                push_write_path(file, "path", false, targets);
+                push_write_path(file, "path", acknowledged, targets);
             }
         }
         "undo_change" => {
@@ -185,7 +260,10 @@ fn collect_write_targets(tool_name: &str, arguments: &Value, targets: &mut Vec<(
                 .and_then(Value::as_str)
                 .and_then(crate::history::get_record)
             {
-                targets.push((PathBuf::from(record.path), false));
+                targets.push(WriteTarget {
+                    path: PathBuf::from(record.path),
+                    acknowledged,
+                });
             }
         }
         "batch_tool_call" => {
@@ -209,15 +287,68 @@ fn collect_write_targets(tool_name: &str, arguments: &Value, targets: &mut Vec<(
 fn push_write_path(
     arguments: &Value,
     field: &str,
-    directory_target: bool,
-    targets: &mut Vec<(PathBuf, bool)>,
+    acknowledged: bool,
+    targets: &mut Vec<WriteTarget>,
 ) {
     if let Some(path) = arguments.get(field).and_then(Value::as_str) {
-        targets.push((
-            crate::common::resolve_write_tool_path(path),
-            directory_target,
-        ));
+        targets.push(WriteTarget {
+            path: crate::common::resolve_write_tool_path(path),
+            acknowledged,
+        });
     }
+}
+
+fn is_write_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "edit_file"
+            | "create_file"
+            | "delete_file"
+            | "create_directory"
+            | "convert_file_format"
+            | "undo_change"
+            | "edit_files"
+    )
+}
+
+fn redact_sensitive_write_fields(value: &mut Value, critical_paths: &[PathBuf]) {
+    if critical_paths.is_empty() {
+        return;
+    }
+    remove_field_recursive(value, "actual_hash");
+}
+
+fn remove_field_recursive(value: &mut Value, field: &str) {
+    match value {
+        Value::Object(object) => {
+            object.remove(field);
+            object
+                .values_mut()
+                .for_each(|child| remove_field_recursive(child, field));
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|child| remove_field_recursive(child, field)),
+        _ => {}
+    }
+}
+
+fn encode_tool_data(mut data: Value, is_error: bool) -> Value {
+    if let Some(object) = data.as_object_mut() {
+        object.remove("__mcp_is_error");
+    }
+    strip_null_fields(&mut data);
+    drop_repeated_fields(&mut data);
+    let mut response = json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string(&data).unwrap_or_default()
+        }]
+    });
+    if is_error {
+        response["isError"] = Value::Bool(true);
+    }
+    response
 }
 
 pub(crate) async fn call_tool_inner_with_cancellation(
@@ -236,7 +367,12 @@ pub(crate) async fn call_tool_inner_with_cancellation(
         );
     }
 
-    argument_warnings.extend(write_target_warnings(name, &arguments));
+    let write_preflight = preflight_write_targets(name, &arguments);
+    argument_warnings.extend(write_preflight.warnings.clone());
+    if let Some(mut error) = write_preflight.confirmation_error {
+        merge_argument_warnings(&mut error, argument_warnings);
+        return Ok(encode_tool_data(error, true));
+    }
 
     let advice_arguments = arguments.clone();
     let started_at = Instant::now();
@@ -283,6 +419,7 @@ pub(crate) async fn call_tool_inner_with_cancellation(
 
     match result {
         Ok(mut data) => {
+            redact_sensitive_write_fields(&mut data, &write_preflight.critical_paths);
             crate::workspace_control::maybe_attach_index_advice(
                 name,
                 &advice_arguments,
@@ -456,6 +593,7 @@ fn classify_tool_error(message: &str) -> &'static str {
 }
 
 fn normalize_tool_arguments(name: &str, mut arguments: Value) -> Result<(Value, Vec<String>)> {
+    normalize_path_alias(name, &mut arguments)?;
     let tool = full_tool_schemas()
         .into_iter()
         .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
@@ -466,6 +604,36 @@ fn normalize_tool_arguments(name: &str, mut arguments: Value) -> Result<(Value, 
     let mut warnings = Vec::new();
     validate_schema_value(&mut arguments, schema, "arguments", name, &mut warnings)?;
     Ok((arguments, warnings))
+}
+
+fn normalize_path_alias(name: &str, arguments: &mut Value) -> Result<()> {
+    if !matches!(
+        name,
+        "find_definition"
+            | "find_references"
+            | "fuzzy_find"
+            | "search_workspace"
+            | "text_search"
+            | "read_symbol_body"
+            | "content_index_status"
+            | "warm_content_index"
+    ) {
+        return Ok(());
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(());
+    };
+    let singular = object.remove("path");
+    match (singular, object.contains_key("paths")) {
+        (Some(_), true) => Err(anyhow::anyhow!(
+            "Invalid arguments for tool '{name}': use either 'path' or 'paths', not both"
+        )),
+        (Some(path), false) => {
+            object.insert("paths".to_string(), Value::Array(vec![path]));
+            Ok(())
+        }
+        (None, _) => Ok(()),
+    }
 }
 
 fn validate_schema_value(
@@ -1193,6 +1361,25 @@ mod tests {
                 .to_string()
                 .contains("Missing required argument 'path'")
         );
+    }
+
+    #[test]
+    fn normalize_tool_arguments_maps_singular_path_alias_and_rejects_ambiguity() {
+        let (arguments, warnings) = normalize_tool_arguments(
+            "find_definition",
+            json!({ "symbol": "helper", "path": "src" }),
+        )
+        .unwrap();
+        assert_eq!(arguments["paths"], json!(["src"]));
+        assert!(arguments.get("path").is_none());
+        assert!(warnings.is_empty());
+
+        let error = normalize_tool_arguments(
+            "fuzzy_find",
+            json!({ "pattern": "helper", "path": "src", "paths": ["tests"] }),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("either 'path' or 'paths'"));
     }
 
     #[test]
