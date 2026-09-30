@@ -739,7 +739,10 @@ fn consider_glob_record(
     if target_type == "dir" && !is_dir {
         return false;
     }
-    if !extensions.is_empty() && !is_dir {
+    if is_dir && !extensions.is_empty() {
+        return false;
+    }
+    if !extensions.is_empty() {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             return false;
         };
@@ -1182,8 +1185,11 @@ fn score_candidate_from_parts(
     if target_type == "dir" && !is_dir {
         return None;
     }
+    if is_dir && !extensions.is_empty() {
+        return None;
+    }
 
-    if !extensions.is_empty() && !is_dir {
+    if !extensions.is_empty() {
         let ext = path.extension().and_then(|e| e.to_str())?;
         if !extensions
             .iter()
@@ -1401,5 +1407,56 @@ mod tests {
         assert_eq!(ranked_matches.len(), 1);
         assert_eq!(ranked_matches[0].relative_path, "a.rs");
         assert_eq!(ranked_matches[0].score, 10);
+    }
+
+    #[test]
+    fn indexed_candidates_reject_directories_with_extension_filter() {
+        let matcher = SkimMatcherV2::default();
+        let extensions = vec!["rs".to_string()];
+        assert!(
+            score_candidate_from_parts(
+                Path::new("src/example.rs"),
+                true,
+                "src/example.rs".to_string(),
+                "example",
+                "any",
+                &extensions,
+                &[],
+                None,
+                &matcher,
+                Some((0, 0))
+            )
+            .is_none()
+        );
+        assert!(
+            score_candidate_from_parts(
+                Path::new("src/example"),
+                true,
+                "src/example".to_string(),
+                "example",
+                "any",
+                &extensions,
+                &[],
+                None,
+                &matcher,
+                Some((0, 0))
+            )
+            .is_none()
+        );
+        assert!(
+            score_candidate_from_parts(
+                Path::new("src/example.rs"),
+                false,
+                "src/example.rs".to_string(),
+                "example",
+                "any",
+                &extensions,
+                &[],
+                None,
+                &matcher,
+                Some((0, 0))
+            )
+            .is_some()
+        );
     }
 }

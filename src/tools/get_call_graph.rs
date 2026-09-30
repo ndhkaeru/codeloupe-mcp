@@ -16,10 +16,12 @@ pub fn schema() -> Value {
             "type": "object",
             "properties": {
                 "file_path": { "type": "string" },
+                "path": { "type": "string", "description": "Alias for file_path; do not pass both." },
                 "symbol": { "type": "string" },
                 "line": { "type": "integer", "minimum": 1, "description": "Optional 1-based declaration line used to select one candidate when names are duplicated." }
             },
-            "required": ["file_path", "symbol"]
+            "required": ["symbol"],
+            "oneOf": [{ "required": ["file_path"] }, { "required": ["path"] }]
         }
     })
 }

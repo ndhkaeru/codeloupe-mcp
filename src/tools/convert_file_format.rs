@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Read;
 
 use crate::history::{attach_history_metadata, file_snapshot, no_history, record_change};
-use crate::tools::read_file::decode_fuzzy;
+use crate::tools::read_file::{decode_fuzzy, is_probably_binary};
 use crate::tools::text_encoding::TextEncoding;
 
 fn line_ending_metadata(content: &str) -> Option<String> {
@@ -83,6 +83,15 @@ pub async fn execute(args: &Value) -> Result<Value> {
             return Err(e.into());
         }
     };
+
+    if is_probably_binary(&buffer) {
+        return Ok(json!({
+            "success": false,
+            "path": crate::common::normalize_display_path(&path),
+            "error_code": "binary_file",
+            "message": "convert_file_format only accepts text files"
+        }));
+    }
 
     let (mut content, detected_encoding) = decode_fuzzy(&buffer);
     let previous_encoding = TextEncoding::parse(detected_encoding)

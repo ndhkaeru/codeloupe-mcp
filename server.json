@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.ndhkaeru/codeloupe-mcp",
-  "description": "Local-first MCP server for code search, code intelligence, repository comparison, and safe file edits.",
+  "description": "Local-first MCP server for code search, repository intelligence, comparison, and safe file edits.",
   "repository": {
     "url": "https://github.com/ndhkaeru/codeloupe-mcp",
     "source": "github"

@@ -2,6 +2,23 @@
 
 All notable changes to `codeloupe-mcp` are documented in this file.
 
+## [Unreleased]
+
+### Security
+
+- Critical-risk writes now stop before mutation and return `risk_confirmation_required`; callers must retry with `acknowledge_risk=true`. Low, medium, and high-risk writes still proceed with warnings.
+- Junction/symlink warnings include the canonical target, and critical-path hash mismatch errors no longer expose `actual_hash`.
+
+### Fixed
+
+- Bounded default line/tail reads to 64 KiB with byte continuations for oversized lines, and reject byte limits too small to advance a UTF-8 continuation.
+- Added a validated singular `path` alias for plural-path tools, immediate CLI `--help`/`--version`, definition marking in `find_references`, correct directory-link representation in `project_map`, and source-checkout gating for the npm launcher fallback.
+
+### Distribution
+
+- Split npm native binaries into six OS/CPU-specific optional packages so the launcher installation downloads only the current platform, with a packed-install E2E check for launcher resolution.
+- Switched Linux release targets from glibc-linked GNU binaries to static musl binaries for older distributions and Alpine compatibility.
+
 ## [1.1.0] - 2026-09-29
 
 ### Breaking Changes

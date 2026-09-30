@@ -31,6 +31,63 @@ fn contains_object_key(value: &Value, key: &str) -> bool {
     }
 }
 
+#[tokio::test]
+async fn test_search_workspace_distinguishes_default_exclusions_from_git_ignored_files() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::create_dir(dir.path().join("build")).unwrap();
+    fs::create_dir(dir.path().join("dist")).unwrap();
+    fs::write(dir.path().join(".gitignore"), "build/\n*.log\n").unwrap();
+    fs::write(dir.path().join("build/gen.py"), "SECRETTOKEN\n").unwrap();
+    fs::write(dir.path().join("dist/bundle.py"), "SECRETTOKEN\n").unwrap();
+    fs::write(dir.path().join("run.log"), "SECRETTOKEN\n").unwrap();
+    let result = search_workspace::execute(&json!({
+        "query": "SECRETTOKEN", "paths": [dir.path()], "max_results": 10
+    }))
+    .await
+    .unwrap();
+    let warnings = result["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("1 ignored file(s)")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| {
+            let text = warning.as_str().unwrap();
+            text.contains("2 file(s) in default-excluded directories")
+                && text.contains("build")
+                && text.contains("dist")
+                && text.contains("paths")
+        }),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_text_search_decodes_windows_1252_for_matching_and_rendering() {
+    let dir = tempdir().unwrap();
+    let legacy = dir.path().join("legacy.txt");
+    fs::write(&legacy, b"first\ncaf\xe9 au lait\n").unwrap();
+    let utf8 = dir.path().join("unicode.txt");
+    fs::write(&utf8, "café au lait\n").unwrap();
+    let late = dir.path().join("late-legacy.txt");
+    let mut late_content = vec![b'a'; 9_000];
+    late_content.extend_from_slice(b"\ncaf\xe9 au lait\n");
+    fs::write(&late, late_content).unwrap();
+    for path in [legacy, utf8, late] {
+        let result = text_search::execute(&json!({
+            "query": "café", "paths": [path], "context_lines": 1
+        }))
+        .await
+        .unwrap();
+        assert_eq!(result["total_returned"], 1, "{result}");
+        assert_eq!(result["matches"][0]["line_text"], "café au lait");
+        assert_eq!(result["matches"][0]["match_column"], 1);
+    }
+}
+
 #[test]
 fn test_structured_errors_hide_windows_verbatim_path_prefixes() {
     let plain = tools::structured_tool_error("failed to read //?/E:/repo/file.rs");
@@ -2273,8 +2330,15 @@ async fn test_managed_build_outputs_are_excluded_without_hiding_source_bin() {
         .pointer("/diagnostics/no_results/default_excludes")
         .and_then(Value::as_array)
         .unwrap();
-    assert!(defaults.iter().any(|value| value == "obj/**"));
-    assert!(defaults.iter().any(|value| value == "bin/**"));
+    assert!(defaults.iter().any(|value| value == "obj"));
+    assert!(defaults.iter().any(|value| value == "bin"));
+    assert!(defaults.len() < 30);
+    let unique = defaults.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        unique.len(),
+        defaults.len(),
+        "default exclusions repeat: {defaults:?}"
+    );
 
     let direct_bin = text_search::execute(&json!({
         "query": "managed_build_needle",

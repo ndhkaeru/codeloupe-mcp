@@ -540,6 +540,26 @@ fn call_binary_server_tool_then_health(
     tool_arguments: Value,
     settle_ms: u64,
 ) -> (Value, Value) {
+    call_binary_server_tool_then_health_wait_for_index(
+        current_dir,
+        initialize_params,
+        extra_env,
+        tool_name,
+        tool_arguments,
+        settle_ms,
+        0,
+    )
+}
+
+fn call_binary_server_tool_then_health_wait_for_index(
+    current_dir: &Path,
+    initialize_params: Value,
+    extra_env: &[(&str, &str)],
+    tool_name: &str,
+    tool_arguments: Value,
+    settle_ms: u64,
+    required_index_workspaces: u64,
+) -> (Value, Value) {
     let exe = server_binary();
     let mut command = Command::new(&exe);
     isolate_server_environment(&mut command);
@@ -600,7 +620,14 @@ fn call_binary_server_tool_then_health(
         stdin.flush().unwrap();
         let health_rpc = read_rpc_response(&mut stdout, request_id);
         let health = decode_tool_rpc_response(&health_rpc);
-        if !health_indexing_in_progress(&health, scheduled_index)
+        let index_not_ready = required_index_workspaces > 0
+            && (health.get("index_workspace_count").and_then(Value::as_u64)
+                < Some(required_index_workspaces)
+                || health
+                    .get("active_index_workspace_root")
+                    .and_then(Value::as_str)
+                    .is_none());
+        if !(health_indexing_in_progress(&health, scheduled_index) || index_not_ready)
             || request_id == 3 + INDEX_SETTLE_MAX_POLLS
         {
             break health_rpc;
@@ -799,9 +826,9 @@ fn file_uri_for_test(path: &Path) -> String {
 }
 
 fn canonical_display_path(path: &Path) -> String {
-    codeloupe_mcp::common::normalize_display_path(&codeloupe_mcp::common::canonicalize_if_exists(
-        path.to_path_buf(),
-    ))
+    codeloupe_mcp::common::normalize_display_path(
+        &codeloupe_mcp::common::canonicalize_with_existing_ancestor(path),
+    )
 }
 
 fn create_directory_link(link: &Path, target: &Path) {
@@ -2040,6 +2067,79 @@ fn test_workspace_index_disable_releases_same_process_handles() {
 }
 
 #[test]
+fn test_text_search_separates_default_excludes_from_git_ignored_files() {
+    let current_dir = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    fs::create_dir(workspace.path().join(".git")).unwrap();
+    fs::create_dir(workspace.path().join("build")).unwrap();
+    fs::create_dir(workspace.path().join("dist")).unwrap();
+    fs::write(workspace.path().join(".gitignore"), "build/\n*.log\n").unwrap();
+    fs::write(workspace.path().join("build/gen.py"), "IGNTOKEN\n").unwrap();
+    fs::write(workspace.path().join("run.log"), "IGNTOKEN\n").unwrap();
+    fs::write(workspace.path().join("dist/bundle.py"), "DISTTOKEN\n").unwrap();
+
+    let root = workspace.path().to_string_lossy().into_owned();
+    let dist = workspace.path().join("dist").to_string_lossy().into_owned();
+    let build = workspace
+        .path()
+        .join("build")
+        .to_string_lossy()
+        .into_owned();
+    let responses = call_binary_server_tools(
+        current_dir.path(),
+        json!({}),
+        vec![
+            ("text_search", json!({"query": "IGNTOKEN", "paths": [root]})),
+            (
+                "text_search",
+                json!({"query": "IGNTOKEN", "paths": [root], "include_ignored": true}),
+            ),
+            (
+                "text_search",
+                json!({"query": "DISTTOKEN", "paths": [root], "include_ignored": true, "include_hidden": true}),
+            ),
+            (
+                "text_search",
+                json!({"query": "DISTTOKEN", "paths": [dist]}),
+            ),
+            (
+                "text_search",
+                json!({"query": "IGNTOKEN", "paths": [build]}),
+            ),
+        ],
+        50,
+    );
+
+    let warnings = responses[0]["diagnostics"]["warnings"].as_array().unwrap();
+    assert_eq!(responses[0]["total_returned"], json!(0));
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("1 ignored file(s)"))
+    );
+    assert!(warnings.iter().any(|warning| {
+        let warning = warning.as_str().unwrap();
+        warning.contains("2 file(s) in default-excluded directories")
+            && warning.contains("build")
+            && warning.contains("dist")
+            && warning.contains("paths")
+    }));
+    assert_eq!(responses[1]["matches"][0]["file"], json!("run.log"));
+    assert_eq!(responses[1]["total_returned"], json!(1));
+    assert!(responses[1]["diagnostics"]["warnings"].is_null());
+    assert_eq!(responses[2]["total_returned"], json!(0));
+    assert!(
+        responses[2]["diagnostics"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| { warning.as_str().unwrap().contains("dist") })
+    );
+    assert_eq!(responses[3]["matches"][0]["file"], json!("bundle.py"));
+    assert_eq!(responses[4]["matches"][0]["file"], json!("gen.py"));
+}
+
+#[test]
 fn test_large_scan_response_attaches_index_advice_once_per_session() {
     let current_dir = tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -2614,13 +2714,14 @@ fn test_tool_call_auto_indexes_workspace_from_request_path() {
     let file_path = workspace.path().join("src/lib.rs");
     fs::write(&file_path, "fn sample() {}\n").unwrap();
 
-    let (_tool_result, health) = call_binary_server_tool_then_health(
+    let (_tool_result, health) = call_binary_server_tool_then_health_wait_for_index(
         current_dir.path(),
         json!({}),
         &[],
         "read_file_range",
         json!({ "path": file_path.to_str().unwrap() }),
         150,
+        1,
     );
 
     let active_root = health
@@ -2728,13 +2829,14 @@ fn test_tool_call_switches_active_workspace_context() {
             { "uri": format!("file:///{}", workspace_a.path().to_string_lossy().replace('\\', "/")) }
         ]
     });
-    let (_tool_result, health) = call_binary_server_tool_then_health(
+    let (_tool_result, health) = call_binary_server_tool_then_health_wait_for_index(
         current_dir.path(),
         init,
         &[],
         "read_file_range",
         json!({ "path": file_b.to_str().unwrap() }),
         150,
+        2,
     );
 
     let active_root = health
@@ -2904,7 +3006,7 @@ fn test_relative_reads_prefer_existing_configured_workspace_path() {
     );
     assert_eq!(
         responses[1]
-            .get("active_index_workspace_root")
+            .get("active_workspace_root")
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .and_then(|path| path.canonicalize().ok()),
@@ -3029,7 +3131,7 @@ fn test_write_tools_warn_by_risk_without_policy_blocks() {
             ),
             (
                 "create_file",
-                json!({"path": ".git/hooks/pre-commit", "content": "blocked\n", "create_parents": true}),
+                json!({"path": ".git/hooks/pre-commit", "content": "acknowledged\n", "create_parents": true, "acknowledge_risk": true}),
             ),
             (
                 "create_file",
@@ -3037,7 +3139,7 @@ fn test_write_tools_warn_by_risk_without_policy_blocks() {
             ),
             (
                 "edit_file",
-                json!({"path": "escape/secret.txt", "mode": "append", "content": "blocked\n"}),
+                json!({"path": "escape/secret.txt", "mode": "append", "content": "acknowledged\n", "acknowledge_risk": true}),
             ),
         ],
         200,
@@ -3114,12 +3216,12 @@ fn test_write_tools_warn_by_risk_without_policy_blocks() {
     assert_eq!(fs::read_to_string(outside_new).unwrap(), "warned\n");
     assert_eq!(
         fs::read_to_string(workspace.path().join(".git/hooks/pre-commit")).unwrap(),
-        "blocked\n"
+        "acknowledged\n"
     );
     assert_eq!(fs::read_to_string(generated_target).unwrap(), "generated\n");
     assert_eq!(
         fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
-        "outside\nblocked\n"
+        "outside\nacknowledged\n"
     );
     let system_classification =
         codeloupe_mcp::security::path_guard::GUARD.classify_path(&system_target);
@@ -3132,6 +3234,310 @@ fn test_write_tools_warn_by_risk_without_policy_blocks() {
             |warning| warning.starts_with("critical write risk: operating-system path:")
         )
     );
+}
+
+#[test]
+fn test_critical_write_requires_preflight_acknowledgement() {
+    let workspace = tempdir().unwrap();
+    fs::create_dir(workspace.path().join(".git")).unwrap();
+    fs::write(workspace.path().join(".git/config"), "[core]\n").unwrap();
+    let hook = workspace.path().join(".git/hooks/pre-commit");
+
+    let responses = call_binary_server_tools(
+        workspace.path(),
+        json!({
+            "workspaceFolders": [
+                { "uri": file_uri_for_test(workspace.path()) }
+            ]
+        }),
+        vec![
+            (
+                "create_file",
+                json!({
+                    "path": hook.to_str().unwrap(),
+                    "content": "first\n",
+                    "create_parents": true
+                }),
+            ),
+            ("list_history", json!({})),
+            (
+                "create_file",
+                json!({
+                    "path": hook.to_str().unwrap(),
+                    "content": "confirmed\n",
+                    "create_parents": true,
+                    "acknowledge_risk": true
+                }),
+            ),
+            ("list_history", json!({})),
+            (
+                "edit_file",
+                json!({
+                    "path": workspace.path().join(".git/config").to_str().unwrap(),
+                    "mode": "append",
+                    "content": "changed\n",
+                    "expected_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "acknowledge_risk": true
+                }),
+            ),
+        ],
+        200,
+    );
+
+    assert_eq!(
+        responses[0].pointer("/error/code").and_then(Value::as_str),
+        Some("risk_confirmation_required"),
+        "unexpected preflight response: {:#}",
+        responses[0]
+    );
+    assert_eq!(
+        responses[0]
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "critical warning should not be duplicated: {:#}",
+        responses[0]
+    );
+    assert_eq!(
+        responses[1].get("total").and_then(Value::as_u64),
+        Some(0),
+        "unacknowledged write created history: {:#}",
+        responses[1]
+    );
+    assert!(responses[2].get("sha256_after").is_some());
+    assert!(
+        responses[2]
+            .get("warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.starts_with("critical write risk: .git path:"))))
+    );
+    assert_eq!(fs::read_to_string(&hook).unwrap(), "confirmed\n");
+    assert_eq!(responses[3].get("total").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        responses[4].pointer("/error/code").and_then(Value::as_str),
+        Some("hash_mismatch")
+    );
+    assert!(responses[4].get("actual_hash").is_none());
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".git/config")).unwrap(),
+        "[core]\n"
+    );
+}
+
+#[test]
+fn test_batch_preflight_blocks_all_writes_before_critical_acknowledgement() {
+    let workspace = tempdir().unwrap();
+    fs::create_dir(workspace.path().join(".git")).unwrap();
+    let safe = workspace.path().join("safe.txt");
+    let hook = workspace.path().join(".git/hooks/pre-commit");
+
+    let responses = call_binary_server_tools(
+        workspace.path(),
+        json!({
+            "workspaceFolders": [
+                { "uri": file_uri_for_test(workspace.path()) }
+            ]
+        }),
+        vec![(
+            "batch_tool_call",
+            json!({
+                "calls": [
+                    {
+                        "tool": "create_file",
+                        "args": {"path": safe.to_str().unwrap(), "content": "safe\n"}
+                    },
+                    {
+                        "tool": "create_file",
+                        "args": {
+                            "path": hook.to_str().unwrap(),
+                            "content": "hook\n",
+                            "create_parents": true
+                        }
+                    }
+                ]
+            }),
+        )],
+        200,
+    );
+
+    assert_eq!(
+        responses[0].pointer("/error/code").and_then(Value::as_str),
+        Some("risk_confirmation_required")
+    );
+    assert!(!safe.exists());
+    assert!(!hook.exists());
+}
+
+#[test]
+fn test_unknown_workspace_junction_warning_shows_canonical_target() {
+    let workspace = tempdir().unwrap();
+    let lexical_parent = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir(workspace.path().join(".git")).unwrap();
+    let link = lexical_parent.path().join("junction");
+    create_directory_link(&link, outside.path());
+    let requested = link.join("escaped.txt");
+    let canonical = outside.path().join("escaped.txt");
+
+    let responses = call_binary_server_tools(
+        workspace.path(),
+        json!({
+            "workspaceFolders": [
+                { "uri": file_uri_for_test(workspace.path()) }
+            ]
+        }),
+        vec![(
+            "create_file",
+            json!({"path": requested.to_str().unwrap(), "content": "escaped\n"}),
+        )],
+        200,
+    );
+
+    let canonical_display = canonical_display_path(&canonical);
+    assert!(
+        responses[0]
+            .get("warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains(&canonical_display)))),
+        "canonical target missing from warning: {:#}",
+        responses[0]
+    );
+    assert_eq!(fs::read_to_string(canonical).unwrap(), "escaped\n");
+}
+
+#[test]
+fn test_path_alias_scopes_plural_path_tools() {
+    let workspace = tempdir().unwrap();
+    let scoped = tempdir().unwrap();
+    fs::create_dir(workspace.path().join(".git")).unwrap();
+    fs::write(workspace.path().join("wrong.rs"), "fn wrong_helper() {}\n").unwrap();
+    fs::write(
+        scoped.path().join("unique_external.rs"),
+        "fn external_helper() {}\n",
+    )
+    .unwrap();
+
+    let responses = call_binary_server_tools(
+        workspace.path(),
+        json!({
+            "workspaceFolders": [
+                { "uri": file_uri_for_test(workspace.path()) }
+            ]
+        }),
+        vec![
+            (
+                "find_definition",
+                json!({
+                    "symbol": "external_helper",
+                    "path": scoped.path().to_str().unwrap()
+                }),
+            ),
+            (
+                "fuzzy_find",
+                json!({
+                    "pattern": "unique_external",
+                    "path": scoped.path().to_str().unwrap()
+                }),
+            ),
+        ],
+        200,
+    );
+
+    assert_eq!(
+        responses[0].get("total_returned").and_then(Value::as_u64),
+        Some(1),
+        "singular path alias did not scope find_definition: {:#}",
+        responses[0]
+    );
+    assert!(
+        responses[1]
+            .get("results")
+            .and_then(Value::as_array)
+            .is_some_and(|matches| matches.iter().any(|matched| matched
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("unique_external.rs")))),
+        "singular path alias did not scope fuzzy_find: {:#}",
+        responses[1]
+    );
+    for response in responses {
+        assert!(
+            !response.to_string().contains("Unknown argument 'path'"),
+            "path alias still emitted an unknown-argument warning: {response:#}"
+        );
+    }
+}
+
+#[test]
+fn test_project_map_lists_directory_links_as_directories() {
+    let workspace = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    fs::create_dir(workspace.path().join(".git")).unwrap();
+    fs::write(target.path().join("target.txt"), "target\n").unwrap();
+    let link = workspace.path().join("linked-directory");
+    create_directory_link(&link, target.path());
+
+    let responses = call_binary_server_tools(
+        workspace.path(),
+        json!({
+            "workspaceFolders": [
+                { "uri": file_uri_for_test(workspace.path()) }
+            ]
+        }),
+        vec![(
+            "project_map",
+            json!({"path": workspace.path().to_str().unwrap(), "max_depth": 2}),
+        )],
+        200,
+    );
+
+    assert!(
+        responses[0]
+            .pointer("/tree_representation/./dirs")
+            .and_then(Value::as_array)
+            .is_some_and(|dirs| dirs.iter().any(|entry| {
+                entry.get("name").and_then(Value::as_str) == Some("linked-directory")
+            })),
+        "directory link was not represented as a directory: {:#}",
+        responses[0]
+    );
+    assert!(
+        !responses[0]
+            .pointer("/tree_representation/./files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| files.iter().any(|entry| {
+                entry.get("name").and_then(Value::as_str) == Some("linked-directory")
+            }))
+    );
+}
+
+#[test]
+fn test_cli_help_version_and_unknown_option_exit_without_starting_server() {
+    let exe = server_binary();
+    let version = Command::new(&exe).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        format!("codeloupe-mcp {}", env!("CARGO_PKG_VERSION"))
+    );
+
+    let help = Command::new(&exe).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(help_stdout.contains("Usage: codeloupe-mcp [OPTIONS]"));
+    assert!(help_stdout.contains("--workspace <PATH>"));
+
+    let unknown = Command::new(&exe)
+        .arg("--definitely-unknown")
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("Unknown option"));
 }
 
 #[test]
@@ -3372,7 +3778,7 @@ fn test_home_roots_are_not_implicitly_write_allowed() {
 }
 
 #[test]
-fn test_sensitive_home_paths_emit_critical_warnings_and_remain_writable() {
+fn test_sensitive_home_paths_require_critical_acknowledgement() {
     let workspace = tempdir().unwrap();
     let fake_home = tempdir().unwrap();
     fs::create_dir(workspace.path().join(".git")).unwrap();
@@ -3448,6 +3854,12 @@ fn test_sensitive_home_paths_emit_critical_warnings_and_remain_writable() {
         responses[0]
     );
     for (response, target) in responses[1..].iter().zip(&sensitive_targets) {
+        assert_eq!(
+            response.pointer("/error/code").and_then(Value::as_str),
+            Some("risk_confirmation_required"),
+            "unexpected response for {}: {response:#}",
+            target.display()
+        );
         assert!(
             response
                 .get("warnings")
@@ -3460,10 +3872,9 @@ fn test_sensitive_home_paths_emit_critical_warnings_and_remain_writable() {
             "unexpected response for {}: {response:#}",
             target.display()
         );
-        assert_eq!(
-            fs::read_to_string(target).unwrap_or_default(),
-            "warned\n",
-            "sensitive target was not written: {}",
+        assert!(
+            !target.exists(),
+            "sensitive target was written before acknowledgement: {}",
             target.display()
         );
     }
@@ -3691,7 +4102,7 @@ fn test_mcp_roots_list_updates_and_replaces_client_roots() {
 }
 
 #[test]
-fn test_write_policy_is_warning_only_even_when_client_supports_elicitation() {
+fn test_write_policy_is_risk_aware_even_when_client_supports_elicitation() {
     let repository = tempdir().unwrap();
     fs::create_dir(repository.path().join(".git")).unwrap();
     let declared_root = repository.path().join("declared");
@@ -3794,7 +4205,7 @@ fn test_write_policy_is_warning_only_even_when_client_supports_elicitation() {
     .unwrap();
     stdin.flush().unwrap();
     let health = decode_tool_rpc_response(&read_rpc_response(&mut stdout, 3));
-    assert_eq!(health["write_scope"], json!("warning_only"));
+    assert_eq!(health["write_scope"], json!("risk_aware"));
     assert_eq!(health["write_elicitation_supported"], json!(false));
     assert_eq!(health["write_approved_directories"], json!([]));
     assert_eq!(health["write_declined_directories"], json!([]));
@@ -3898,7 +4309,7 @@ fn test_declared_subdirectories_allow_warned_writes_in_inferred_repo_root() {
     assert_eq!(history[2]["outside_declared"], json!(false));
 
     let inferred_root = canonical_display_path(repository.path());
-    assert_eq!(responses[4]["write_scope"], json!("warning_only"));
+    assert_eq!(responses[4]["write_scope"], json!("risk_aware"));
     assert_eq!(responses[4]["write_approved_directories"], json!([]));
     assert_eq!(responses[4]["write_declined_directories"], json!([]));
     let configured = responses[4]

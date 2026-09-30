@@ -8,7 +8,7 @@ use crate::history::{
 };
 use crate::limits::MAX_IN_MEMORY_TEXT_FILE_BYTES;
 use crate::security::path_guard::GUARD;
-use crate::tools::read_file::decode_fuzzy;
+use crate::tools::read_file::{decode_fuzzy, is_probably_binary};
 use crate::tools::text_encoding::TextEncoding;
 
 const MAX_EDIT_FILE_BYTES: u64 = MAX_IN_MEMORY_TEXT_FILE_BYTES;
@@ -25,6 +25,7 @@ fn error_reason(error_code: &str) -> &'static str {
     match error_code {
         "invalid_path" => "Path argument is missing or invalid.",
         "invalid_mode" => "Mode is not one of supported values.",
+        "binary_file" => "Only text files can be edited.",
         "path_is_directory" => "Target path points to a directory, not a file.",
         "file_too_large" => "File exceeds allowed size for this operation.",
         "file_not_found" => "Target file does not exist.",
@@ -59,6 +60,7 @@ pub fn schema() -> Value {
                 "mode": {
                     "type": "string",
                     "enum": ["replace", "append", "prepend", "find_replace"],
+                    "description": "Required: use find_replace for a surgical edit, or explicitly use replace to rewrite the whole file.",
                 },
                 "content": { "type": "string", "description": "New content for replace, append, or prepend modes. Not used by find_replace." },
                 "find": { "type": "string", "description": "Exact text to find in find_replace mode. Required and must be non-empty for find_replace." },
@@ -228,7 +230,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
     let mode = args
         .get("mode")
         .and_then(|v| v.as_str())
-        .unwrap_or("replace")
+        .unwrap_or("")
         .to_ascii_lowercase();
 
     if !["replace", "append", "prepend", "find_replace"].contains(&mode.as_str()) {
@@ -236,7 +238,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
             &path,
             &canonical_from_guard,
             "invalid_mode",
-            "mode must be one of: replace, append, prepend, find_replace",
+            "mode is required: use mode=find_replace for find/replace, mode=append or mode=prepend for fragments, or explicitly set mode=replace to rewrite the whole file",
         ));
     }
 
@@ -298,6 +300,15 @@ pub async fn execute(args: &Value) -> Result<Value> {
                     ));
                 }
             };
+
+            if is_probably_binary(&bytes) {
+                return Ok(error_response(
+                    &path,
+                    &canonical_from_guard,
+                    "binary_file",
+                    "edit_file only accepts text files",
+                ));
+            }
 
             let (decoded, detected_encoding) = decode_fuzzy(&bytes);
             let detected_encoding = TextEncoding::parse(detected_encoding)

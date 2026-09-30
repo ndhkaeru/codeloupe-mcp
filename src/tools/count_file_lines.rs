@@ -41,7 +41,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
             "bom": inspection.bom,
             "is_binary": true,
             "line_count": 0,
-            "warning": "This appears to be a binary file."
+            "warnings": ["This appears to be a binary file."]
         }));
     }
 

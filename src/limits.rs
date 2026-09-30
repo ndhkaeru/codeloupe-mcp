@@ -3,7 +3,7 @@ pub const MIB: u64 = 1024 * KIB;
 
 pub const BINARY_PROBE_BYTES: usize = 8 * KIB as usize;
 pub const DEFAULT_BYTE_RANGE_BYTES: usize = 64 * KIB as usize;
-pub const DEFAULT_JSON_POINTER_OUTPUT_BYTES: usize = MIB as usize;
+pub const DEFAULT_JSON_POINTER_OUTPUT_BYTES: usize = DEFAULT_BYTE_RANGE_BYTES;
 pub const MAX_IN_MEMORY_TEXT_FILE_BYTES: u64 = 10 * MIB;
 pub const FILE_SUMMARY_LINE_COUNT_BYTES: u64 = 50 * MIB;
 

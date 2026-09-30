@@ -460,6 +460,31 @@ async fn test_read_file_tail_and_byte_ranges_are_bounded_and_resumable() {
 
     let long_path = dir.path().join("long-line.txt");
     std::fs::write(&long_path, "x".repeat(2 * 1024 * 1024)).unwrap();
+    let default_line_range = read_file::execute(&json!({
+        "path": long_path.to_str().unwrap()
+    }))
+    .await
+    .unwrap();
+    assert_eq!(
+        default_line_range
+            .get("content")
+            .and_then(|value| value.as_str())
+            .map(str::len),
+        Some(64 * 1024)
+    );
+    assert_eq!(
+        default_line_range
+            .get("line_truncated")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        default_line_range
+            .get("next_start_byte")
+            .and_then(|value| value.as_u64()),
+        Some(64 * 1024)
+    );
+
     let line_range = read_file::execute(&json!({
         "path": long_path.to_str().unwrap(),
         "max_bytes": 16
@@ -483,6 +508,33 @@ async fn test_read_file_tail_and_byte_ranges_are_bounded_and_resumable() {
         Some(16)
     );
     assert!(line_range.get("next_start_line").is_none());
+
+    let too_small_for_line_number = read_file::execute(&json!({
+        "path": long_path.to_str().unwrap(),
+        "max_bytes": 2,
+        "include_line_numbers": true
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        too_small_for_line_number
+            .to_string()
+            .contains("too small to return any complete UTF-8 content")
+    );
+
+    let unicode_path = dir.path().join("unicode-line.txt");
+    std::fs::write(&unicode_path, "ééé").unwrap();
+    let too_small_for_utf8 = read_file::execute(&json!({
+        "path": unicode_path.to_str().unwrap(),
+        "max_bytes": 1
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        too_small_for_utf8
+            .to_string()
+            .contains("too small to return any complete UTF-8 content")
+    );
 
     let line_snippets = read_snippets::execute(&json!({
         "requests": [{
@@ -643,6 +695,29 @@ async fn test_read_file_streams_rfc6901_json_pointer_values() {
     .await
     .unwrap_err();
     assert!(too_small.to_string().contains("too large to return"));
+}
+
+#[tokio::test]
+async fn test_json_pointer_default_rejects_values_over_64_kib() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("large-pointer.json");
+    let document = json!({"payload": "x".repeat(80_000)});
+    std::fs::write(&path, document.to_string()).unwrap();
+    let error = read_file::execute(&json!({
+        "path": path, "json_pointer": "/payload"
+    }))
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("65536 byte limit"));
+    assert!(error.to_string().contains("increase max_bytes"));
+
+    let explicit = read_file::execute(&json!({
+        "path": path, "json_pointer": "/payload", "max_bytes": 81_000
+    }))
+    .await
+    .unwrap();
+    assert!(explicit["returned_bytes"].as_u64().unwrap() > 65_536);
+    assert_eq!(explicit["max_bytes_defaulted"], false);
 }
 
 #[tokio::test]

@@ -8,8 +8,8 @@ use tokio::task;
 use crate::limits::{FIND_REFERENCES_FILE_SIZE_BYTES, MAX_SKIPPED_FILE_DETAILS};
 use crate::tools::{
     ast_support::{
-        classify_reference_match, parse_supported_file, symbol_segments,
-        visit_candidate_code_files_with_options,
+        classify_reference_match, is_symbol_definition_match, parse_supported_file,
+        symbol_segments, visit_candidate_code_files_with_options,
     },
     path_filters::filtered_scope_warnings,
     search_snippet::LossyMatchSink,
@@ -214,6 +214,20 @@ fn execute_blocking(args: Value) -> Result<Value> {
                         &mut reference,
                         "classification",
                         json!(classification),
+                    );
+                }
+                if parsed.as_ref().is_some_and(|parsed| {
+                    is_symbol_definition_match(
+                        parsed.tree.root_node(),
+                        &parsed.source,
+                        symbol,
+                        matched.absolute_byte_offset as usize,
+                    )
+                }) {
+                    crate::common::insert_object_field(
+                        &mut reference,
+                        "is_definition",
+                        Value::Bool(true),
                     );
                 }
                 references.push(reference);

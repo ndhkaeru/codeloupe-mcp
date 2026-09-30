@@ -172,17 +172,10 @@ fn execute_blocking(args: Value) -> Result<Value> {
         if entry.path() == filter_root {
             return true;
         }
-        if entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_dir())
-            && is_vcs_metadata_dir(entry.path(), &filter_root)
-        {
+        if directory_like_entry(entry) && is_vcs_metadata_dir(entry.path(), &filter_root) {
             return false;
         }
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_dir())
-        {
+        if !directory_like_entry(entry) {
             return true;
         }
         if filter_excludes.is_empty() {
@@ -211,7 +204,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
             break;
         }
 
-        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        let is_dir = directory_like_entry(&entry);
         if has_patterns
             && !passes_patterns(
                 entry.path(),
@@ -296,6 +289,16 @@ fn execute_blocking(args: Value) -> Result<Value> {
         attach_index_diagnostics(response, std::slice::from_ref(&canonical_path), false),
         verbose,
     ))
+}
+
+fn directory_like_entry(entry: &ignore::DirEntry) -> bool {
+    entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir())
+        || entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_symlink())
+            && entry.path().is_dir()
 }
 
 #[allow(clippy::too_many_arguments)]

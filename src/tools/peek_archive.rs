@@ -22,9 +22,10 @@ pub fn schema() -> Value {
             "type": "object",
             "properties": {
                 "archive_path": { "type": "string" },
+                "path": { "type": "string", "description": "Alias for archive_path; do not pass both." },
                 "inner_path": { "type": "string" }
             },
-            "required": ["archive_path"]
+            "oneOf": [{ "required": ["archive_path"] }, { "required": ["path"] }]
         }
     })
 }

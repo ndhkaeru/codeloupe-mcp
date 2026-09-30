@@ -316,6 +316,9 @@ pub(crate) fn execute_sync(args: &Value) -> Result<Value> {
     if start_line == 0 {
         return Err(anyhow::anyhow!("start_line must be >= 1"));
     }
+    if has_end_line && end_line < start_line {
+        return Err(anyhow::anyhow!("end_line must be >= start_line"));
+    }
     if tail == Some(0) {
         return Err(anyhow::anyhow!("tail must be >= 1"));
     }
@@ -370,9 +373,15 @@ pub(crate) fn execute_sync(args: &Value) -> Result<Value> {
             end_line,
         },
     };
+    let line_max_bytes = max_bytes.or(Some(DEFAULT_BYTE_RANGE_BYTES));
 
-    let streaming_result =
-        read_utf8_streaming(&path, selection, include_line_numbers, max_lines, max_bytes)?;
+    let streaming_result = read_utf8_streaming(
+        &path,
+        selection,
+        include_line_numbers,
+        max_lines,
+        line_max_bytes,
+    )?;
     let read_result = match streaming_result {
         StreamingRead::Text(result) => result,
         StreamingRead::Binary { bom } => {
@@ -388,7 +397,13 @@ pub(crate) fn execute_sync(args: &Value) -> Result<Value> {
                     MAX_IN_MEMORY_TEXT_FILE_BYTES
                 ));
             }
-            read_range_full_decode(&path, selection, include_line_numbers, max_lines, max_bytes)?
+            read_range_full_decode(
+                &path,
+                selection,
+                include_line_numbers,
+                max_lines,
+                line_max_bytes,
+            )?
         }
     };
 
@@ -450,7 +465,7 @@ fn binary_response(file_size_bytes: u64, bom: bool) -> Value {
         "truncated": false,
         "returned_lines": 0,
         "omitted_lines": 0,
-        "warning": "This appears to be a binary file; text content was not returned."
+        "warnings": ["This appears to be a binary file; text content was not returned."]
     })
 }
 
@@ -495,6 +510,7 @@ fn read_utf8_range_streaming(
     let mut output_limit_reached = false;
     let mut line_truncated = false;
     let mut next_start_byte = None;
+    let mut non_progressing_limit = false;
 
     let outcome = visit_utf8_lines(path, |line_number, line_start_byte, line| {
         if line_number < start_line || line_number > end_line {
@@ -525,9 +541,14 @@ fn read_utf8_range_streaming(
                     .len()
                     .saturating_sub(rendered_prefix_bytes)
                     .min(line.len());
-                rendered_lines.push(prefix.to_string());
-                line_truncated = true;
-                next_start_byte = Some(line_start_byte.saturating_add(raw_bytes_consumed as u64));
+                if raw_bytes_consumed == 0 {
+                    non_progressing_limit = true;
+                } else {
+                    rendered_lines.push(prefix.to_string());
+                    line_truncated = true;
+                    next_start_byte =
+                        Some(line_start_byte.saturating_add(raw_bytes_consumed as u64));
+                }
             }
             output_limit_reached = true;
             return;
@@ -542,6 +563,11 @@ fn read_utf8_range_streaming(
         Utf8VisitOutcome::Binary { bom } => return Ok(StreamingRead::Binary { bom }),
         Utf8VisitOutcome::NeedsFullDecode => return Ok(StreamingRead::NeedsFullDecode),
     };
+    if non_progressing_limit {
+        return Err(anyhow::anyhow!(
+            "max_bytes is too small to return any complete UTF-8 content from the selected line"
+        ));
+    }
     let actual_start = std::cmp::min(start_line - 1, info.total_lines) + 1;
     let actual_end = std::cmp::min(end_line, info.total_lines);
     let limited = finish_streamed_content(
@@ -599,7 +625,7 @@ fn read_utf8_tail_streaming(
         max_bytes,
         info.ends_with_newline && !line_refs.is_empty(),
         first_line_start_byte,
-    );
+    )?;
 
     Ok(StreamingRead::Text(ReadRangeResult {
         limited,
@@ -817,7 +843,7 @@ fn read_range_full_decode(
         max_bytes,
         ends_with_newline && actual_end == total_lines,
         None,
-    );
+    )?;
 
     Ok(ReadRangeResult {
         limited,
@@ -1167,7 +1193,7 @@ fn apply_limits(
     max_bytes: Option<usize>,
     append_terminal_newline: bool,
     first_line_start_byte: Option<u64>,
-) -> LimitedContent {
+) -> Result<LimitedContent> {
     let line_limit = max_lines.unwrap_or(usize::MAX);
     let byte_limit = max_bytes.unwrap_or(usize::MAX);
     let mut rendered_lines = Vec::new();
@@ -1201,6 +1227,11 @@ fn apply_limits(
                     .len()
                     .saturating_sub(rendered_prefix_bytes)
                     .min(line.len());
+                if raw_bytes_consumed == 0 {
+                    return Err(anyhow::anyhow!(
+                        "max_bytes is too small to return any complete UTF-8 content from the selected line"
+                    ));
+                }
                 rendered_lines.push(prefix.to_string());
                 line_truncated = true;
                 next_start_byte = first_line_start_byte
@@ -1232,7 +1263,7 @@ fn apply_limits(
         content.push('\n');
     }
 
-    LimitedContent {
+    Ok(LimitedContent {
         content,
         returned_lines,
         truncated,
@@ -1241,7 +1272,7 @@ fn apply_limits(
         next_start_line,
         next_start_byte,
         end_line,
-    }
+    })
 }
 
 fn utf8_prefix(value: &str, max_bytes: usize) -> &str {

@@ -12,6 +12,57 @@ fn register_write_workspace(path: &Path) {
     workspace_control::register_configured_workspace(path.to_path_buf(), "write_tool_test", true);
 }
 
+#[tokio::test]
+async fn test_single_file_edits_and_conversion_reject_binary_without_changes() {
+    let dir = tempdir().unwrap();
+    register_write_workspace(dir.path());
+    for (name, original) in [
+        ("image.png", b"\x89PNG\r\n\x1a\n\0payload".as_slice()),
+        ("data.dat", b"alpha\0beta\n".as_slice()),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, original).unwrap();
+        for arguments in [
+            json!({"path": path, "mode": "append", "content": "MORE"}),
+            json!({"path": path, "mode": "find_replace", "find": "alpha", "replace": "new"}),
+        ] {
+            let result = edit_file::execute(&arguments).await.unwrap();
+            assert_eq!(result["error_code"], "binary_file");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        let result = convert_file_format::execute(&json!({
+            "path": path, "target_line_ending": "crlf"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(result["error_code"], "binary_file");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn test_edit_file_requires_explicit_mode_before_writing() {
+    let dir = tempdir().unwrap();
+    register_write_workspace(dir.path());
+    let path = dir.path().join("important.txt");
+    std::fs::write(&path, "keep this content").unwrap();
+    for arguments in [
+        json!({"path": path, "content": "overwrite"}),
+        json!({"path": path, "find": "keep", "replace": "replace"}),
+    ] {
+        let result = edit_file::execute(&arguments).await.unwrap();
+        assert_eq!(result["error_code"], "invalid_mode");
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("mode=find_replace")
+        );
+        assert!(result["message"].as_str().unwrap().contains("mode=replace"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep this content");
+    }
+}
+
 fn encode_utf16_with_bom(content: &str, encoding: &str) -> Vec<u8> {
     let mut bytes = match encoding {
         "UTF-16LE" => vec![0xFF, 0xFE],

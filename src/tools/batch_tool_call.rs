@@ -194,18 +194,6 @@ pub fn execute(args: &Value) -> Pin<Box<dyn Future<Output = Result<Value>> + '_>
                 remaining_output_budget = remaining_output_budget.saturating_sub(returned_bytes);
                 continue;
             }
-            if !crate::security::rate_limiter::GLOBAL_LIMITER.allow() {
-                partial = true;
-                let returned_bytes = push_error(
-                    &mut results,
-                    &mut summary,
-                    tool_label,
-                    "Rate limit exceeded (max 50 req/s)".to_string(),
-                    call_output_budget,
-                );
-                remaining_output_budget = remaining_output_budget.saturating_sub(returned_bytes);
-                continue;
-            }
             let remaining_deadline = deadline.saturating_sub(started_at.elapsed());
             let requested_timeout = call
                 .get("timeout_seconds")

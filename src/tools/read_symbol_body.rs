@@ -118,7 +118,8 @@ fn execute_blocking(args: Value) -> Result<Value> {
             "ambiguous": true,
             "match_source": "ast",
             "total_candidates": candidates.len(),
-            "candidates": candidates
+            "candidates": candidates,
+            "suggested_next_query": "Specify file_hint using one candidate path (or narrow paths); use line to select a declaration within that file."
         }));
     }
 
@@ -195,7 +196,25 @@ fn resolve_file_hint(raw: &str, search_paths: &[PathBuf]) -> Result<PathBuf> {
         }
 
         if candidates.is_empty() {
-            push_file_hint_candidate(&mut candidates, crate::common::resolve_tool_path(raw));
+            for search_path in search_paths {
+                if !search_path.is_dir() {
+                    continue;
+                }
+                crate::tools::ast_support::visit_candidate_code_files(
+                    std::slice::from_ref(search_path),
+                    None,
+                    None,
+                    |candidate| {
+                        if candidate.ends_with(&input) {
+                            push_file_hint_candidate(&mut candidates, candidate.to_path_buf());
+                        }
+                        Ok(candidates.len() < 20)
+                    },
+                )?;
+            }
+            if candidates.is_empty() {
+                push_file_hint_candidate(&mut candidates, crate::common::resolve_tool_path(raw));
+            }
         }
     }
 
@@ -206,7 +225,7 @@ fn resolve_file_hint(raw: &str, search_paths: &[PathBuf]) -> Result<PathBuf> {
             crate::common::normalize_display_path(&input)
         )),
         _ => Err(anyhow::anyhow!(
-            "file_hint is ambiguous across search paths: {}",
+            "file_hint is ambiguous across search paths: {}; use a relative subpath or a full candidate path",
             candidates
                 .iter()
                 .map(|candidate| crate::common::normalize_display_path(candidate))
@@ -261,8 +280,10 @@ fn try_ast_matches(
         find_symbol_candidates(parsed.tree.root_node(), &parsed.source, symbol, line)
             .into_iter()
             .map(|candidate| {
+                let declaration =
+                    crate::tools::ast_support::symbol_declaration_node(candidate.node);
                 let content_node = if include_signature {
-                    candidate.node
+                    declaration
                 } else {
                     candidate
                         .node
@@ -274,8 +295,8 @@ fn try_ast_matches(
                         .to_string(),
                     start_line: content_node.start_position().row + 1,
                     end_line: content_node.end_position().row + 1,
-                    declaration_start_line: candidate.node.start_position().row + 1,
-                    declaration_end_line: candidate.node.end_position().row + 1,
+                    declaration_start_line: declaration.start_position().row + 1,
+                    declaration_end_line: declaration.end_position().row + 1,
                     name: candidate.name,
                     qualified_name: candidate.qualified_name,
                 }

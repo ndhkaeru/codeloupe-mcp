@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 const FILTER_PROBE_MAX_FILES: usize = 50_000;
@@ -11,6 +11,8 @@ const FILTER_PROBE_MAX_FILES: usize = 50_000;
 pub struct FilteredFileCounts {
     pub ignored_files: usize,
     pub hidden_files: usize,
+    pub default_excluded_files: usize,
+    pub default_excluded_directories: Vec<String>,
     pub complete: bool,
 }
 
@@ -175,7 +177,16 @@ pub fn filtered_file_counts(
     include_ignored: bool,
     include_hidden: bool,
 ) -> FilteredFileCounts {
-    if include_ignored && include_hidden {
+    filtered_file_counts_with_defaults(paths, include_ignored, include_hidden, false)
+}
+
+fn filtered_file_counts_with_defaults(
+    paths: &[PathBuf],
+    include_ignored: bool,
+    include_hidden: bool,
+    include_default_excludes: bool,
+) -> FilteredFileCounts {
+    if include_ignored && include_hidden && !include_default_excludes {
         return FilteredFileCounts {
             complete: true,
             ..FilteredFileCounts::default()
@@ -184,25 +195,72 @@ pub fn filtered_file_counts(
 
     let (current, current_complete) = collect_probe_files(paths, include_ignored, include_hidden);
     let (all_files, all_complete) = collect_probe_files(paths, true, true);
+    let mut default_excluded = HashSet::new();
+    let mut default_excluded_directories = BTreeSet::new();
+    if include_default_excludes {
+        let include_managed_bin = !paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| crate::common::workspace_uses_managed_build_outputs(path));
+        let roots: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| path.is_dir())
+            .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+            .collect();
+        for file in &all_files {
+            let excluded_directory = roots.iter().find_map(|root| {
+                file.strip_prefix(root)
+                    .ok()?
+                    .parent()?
+                    .components()
+                    .find_map(|component| {
+                        let name = component.as_os_str().to_str()?;
+                        (crate::common::is_default_excluded_directory_name(
+                            name,
+                            include_managed_bin,
+                        ) && (cfg!(windows) || name == name.to_ascii_lowercase()))
+                        .then(|| name.to_string())
+                    })
+            });
+            if let Some(name) = excluded_directory {
+                default_excluded.insert(file.clone());
+                default_excluded_directories.insert(name);
+            }
+        }
+    }
     let mut counts = FilteredFileCounts {
         complete: current_complete && all_complete,
+        default_excluded_files: default_excluded.len(),
+        default_excluded_directories: default_excluded_directories.into_iter().collect(),
         ..FilteredFileCounts::default()
     };
 
     match (include_ignored, include_hidden) {
         (false, false) => {
             let (with_ignored, ignored_complete) = collect_probe_files(paths, true, false);
-            counts.ignored_files = with_ignored.difference(&current).count();
-            counts.hidden_files = all_files.difference(&with_ignored).count();
+            counts.ignored_files = with_ignored
+                .difference(&current)
+                .filter(|file| !default_excluded.contains(*file))
+                .count();
+            counts.hidden_files = all_files
+                .difference(&with_ignored)
+                .filter(|file| !default_excluded.contains(*file))
+                .count();
             counts.complete &= ignored_complete;
         }
         (false, true) => {
-            counts.ignored_files = all_files.difference(&current).count();
+            counts.ignored_files = all_files
+                .difference(&current)
+                .filter(|file| !default_excluded.contains(*file))
+                .count();
         }
         (true, false) => {
-            counts.hidden_files = all_files.difference(&current).count();
+            counts.hidden_files = all_files
+                .difference(&current)
+                .filter(|file| !default_excluded.contains(*file))
+                .count();
         }
-        (true, true) => unreachable!("inclusive scopes return before probing"),
+        (true, true) => {}
     }
     counts
 }
@@ -212,10 +270,24 @@ pub fn filtered_scope_warnings(
     include_ignored: bool,
     include_hidden: bool,
 ) -> Vec<String> {
-    if include_ignored && include_hidden {
+    filtered_scope_warnings_with_defaults(paths, include_ignored, include_hidden, false)
+}
+
+pub fn filtered_scope_warnings_with_defaults(
+    paths: &[PathBuf],
+    include_ignored: bool,
+    include_hidden: bool,
+    include_default_excludes: bool,
+) -> Vec<String> {
+    if include_ignored && include_hidden && !include_default_excludes {
         return Vec::new();
     }
-    let counts = filtered_file_counts(paths, include_ignored, include_hidden);
+    let counts = filtered_file_counts_with_defaults(
+        paths,
+        include_ignored,
+        include_hidden,
+        include_default_excludes,
+    );
     let qualifier = if counts.complete { "" } else { "at least " };
     let mut warnings = Vec::new();
     if !include_ignored && counts.ignored_files > 0 {
@@ -228,6 +300,13 @@ pub fn filtered_scope_warnings(
         warnings.push(format!(
             "Scope excludes {qualifier}{} hidden file(s); retry with include_hidden=true to search them. Hidden VCS metadata directories remain excluded unless scoped directly.",
             counts.hidden_files
+        ));
+    }
+    if counts.default_excluded_files > 0 {
+        warnings.push(format!(
+            "Scope excludes {qualifier}{} file(s) in default-excluded directories ({}); retry with paths pointing directly into those directories to search them.",
+            counts.default_excluded_files,
+            counts.default_excluded_directories.join(", ")
         ));
     }
     warnings

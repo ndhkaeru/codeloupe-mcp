@@ -121,6 +121,17 @@ impl PathGuard {
             );
         }
 
+        if path_resolves_through_link(path) && !same_display_path(path, &canonical) {
+            return warned(
+                canonical,
+                Tier::HighRiskWarn,
+                format!(
+                    "high write risk: symlink or junction resolves outside the requested path: requested {display_str}; canonical target {canonical_str}"
+                ),
+                true,
+            );
+        }
+
         if crate::workspace_control::write_workspace_scope_for_path(&canonical).is_some() {
             return warned(
                 canonical,
@@ -130,12 +141,8 @@ impl PathGuard {
             );
         }
 
-        warned(
-            canonical,
-            Tier::LowRiskWarn,
-            format!("low write risk: outside write roots: {display_str}"),
-            true,
-        )
+        let warning = format!("low write risk: outside write roots: {canonical_str}");
+        warned(canonical, Tier::LowRiskWarn, warning, true)
     }
 }
 
@@ -303,8 +310,108 @@ fn contains_git_component(path: &Path) -> bool {
     })
 }
 
+fn same_display_path(left: &Path, right: &Path) -> bool {
+    let left = crate::common::normalize_display_path(&crate::common::lexical_normalize(left));
+    let right = crate::common::normalize_display_path(right);
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(&right)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        normalize_macos_system_alias(&left) == normalize_macos_system_alias(&right)
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        left == right
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_system_alias(path: &str) -> String {
+    for (canonical, alias) in [
+        ("/private/var", "/var"),
+        ("/private/tmp", "/tmp"),
+        ("/private/etc", "/etc"),
+    ] {
+        if path == canonical {
+            return alias.to_string();
+        }
+        if let Some(suffix) = path.strip_prefix(canonical)
+            && suffix.starts_with('/')
+        {
+            return format!("{alias}{suffix}");
+        }
+    }
+    path.to_string()
+}
+
+fn path_resolves_through_link(path: &Path) -> bool {
+    let absolute = crate::common::lexical_normalize(path);
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 lazy_static::lazy_static! {
     pub static ref GUARD: PathGuard = PathGuard::new(vec![
         "**/node_modules/**".to_string(),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_display_path;
+    use std::path::Path;
+
+    #[test]
+    #[cfg(windows)]
+    fn display_path_comparison_is_case_insensitive_on_windows() {
+        assert!(same_display_path(
+            Path::new(r"C:\Temp\Link"),
+            Path::new(r"c:\temp\link")
+        ));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn display_path_comparison_is_case_sensitive_off_windows() {
+        assert!(!same_display_path(
+            Path::new("/tmp/Link"),
+            Path::new("/tmp/link")
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn display_path_comparison_accepts_standard_macos_aliases() {
+        assert!(same_display_path(
+            Path::new("/var/folders/example/file.txt"),
+            Path::new("/private/var/folders/example/file.txt")
+        ));
+        assert!(same_display_path(
+            Path::new("/tmp/example/file.txt"),
+            Path::new("/private/tmp/example/file.txt")
+        ));
+        assert!(same_display_path(
+            Path::new("/etc/example.conf"),
+            Path::new("/private/etc/example.conf")
+        ));
+    }
 }

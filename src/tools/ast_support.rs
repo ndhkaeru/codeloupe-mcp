@@ -485,34 +485,41 @@ pub fn child_field_text<'a>(node: &Node<'a>, field: &str, source: &'a [u8]) -> O
 }
 
 pub fn declaration_name<'a>(node: &Node<'a>, source: &'a [u8]) -> Option<&'a str> {
-    child_field_text(node, "name", source)
-        .or_else(|| child_field_text(node, "function", source))
-        .or_else(|| child_field_text(node, "method", source))
+    declaration_name_node(node).and_then(|name| node_text(name, source))
+}
+
+fn declaration_name_node<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    if matches!(node.kind(), "arrow_function" | "function_expression")
+        && let Some(declarator) = node.parent()
+        && declarator.kind() == "variable_declarator"
+        && declarator.child_by_field_name("value") == Some(*node)
+    {
+        return declarator.child_by_field_name("name");
+    }
+    node.child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("function"))
+        .or_else(|| node.child_by_field_name("method"))
         .or_else(|| {
             node.child_by_field_name("declarator")
-                .and_then(|declarator| declarator_name(declarator, source))
+                .and_then(declarator_name_node)
         })
-        .or_else(|| first_identifier_child(node, source))
+        .or_else(|| first_identifier_child_node(node))
 }
 
-fn first_identifier_child<'a>(node: &Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+fn first_identifier_child_node<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if is_identifier_like_node(child.kind()) {
-            return node_text(child, source);
-        }
-    }
-    None
+    node.named_children(&mut cursor)
+        .find(|child| is_identifier_like_node(child.kind()))
 }
 
-fn declarator_name<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+fn declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
     if is_identifier_like_node(node.kind()) {
-        return node_text(node, source);
+        return Some(node);
     }
 
     for field in ["declarator", "name", "function", "method"] {
         if let Some(field_node) = node.child_by_field_name(field)
-            && let Some(name) = declarator_name(field_node, source)
+            && let Some(name) = declarator_name_node(field_node)
         {
             return Some(name);
         }
@@ -520,7 +527,7 @@ fn declarator_name<'a>(node: Node<'a>, source: &'a [u8]) -> Option<&'a str> {
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if let Some(name) = declarator_name(child, source) {
+        if let Some(name) = declarator_name_node(child) {
             return Some(name);
         }
     }
@@ -637,6 +644,27 @@ pub fn first_line_preview(node: Node<'_>, source: &[u8], max_bytes: usize) -> St
         .to_string()
 }
 
+pub fn symbol_declaration_node(node: Node<'_>) -> Node<'_> {
+    if matches!(node.kind(), "arrow_function" | "function_expression")
+        && let Some(declarator) = node.parent()
+        && declarator.kind() == "variable_declarator"
+        && declarator.child_by_field_name("value") == Some(node)
+        && let Some(declaration) = declarator.parent()
+        && matches!(
+            declaration.kind(),
+            "lexical_declaration" | "variable_declaration"
+        )
+    {
+        if let Some(export) = declaration.parent()
+            && export.kind() == "export_statement"
+        {
+            return export;
+        }
+        return declaration;
+    }
+    node
+}
+
 pub fn is_symbol_node(kind: &str) -> bool {
     matches!(
         kind,
@@ -677,6 +705,7 @@ pub fn is_symbol_node(kind: &str) -> bool {
             | "class"
             | "module"
             | "arrow_function"
+            | "function_expression"
             | "init_declaration"
             | "protocol_declaration"
             | "protocol_function_declaration"
@@ -696,6 +725,8 @@ pub fn is_function_like_node(kind: &str) -> bool {
         "function_item"
             | "function_definition"
             | "function_declaration"
+            | "arrow_function"
+            | "function_expression"
             | "method_definition"
             | "method_declaration"
             | "constructor_declaration"
@@ -717,7 +748,9 @@ pub fn find_symbol_candidates<'a>(
         .into_iter()
         .filter(|candidate| {
             symbol_query_matches(symbol, &candidate.qualified_name)
-                && line.is_none_or(|line| candidate.node.start_position().row + 1 == line)
+                && line.is_none_or(|line| {
+                    symbol_declaration_node(candidate.node).start_position().row + 1 == line
+                })
         })
         .collect::<Vec<_>>();
     if line.is_some() {
@@ -769,19 +802,49 @@ pub fn classify_reference_match(root: Node<'_>, byte_offset: usize) -> &'static 
     "code"
 }
 
+pub fn is_symbol_definition_match(
+    root: Node<'_>,
+    source: &[u8],
+    symbol: &str,
+    byte_offset: usize,
+) -> bool {
+    if byte_offset >= root.end_byte() {
+        return false;
+    }
+    let end_byte = (byte_offset + 1).min(root.end_byte());
+    let Some(mut node) = root.descendant_for_byte_range(byte_offset, end_byte) else {
+        return false;
+    };
+    loop {
+        if is_symbol_node(node.kind())
+            && let Some(name_node) = declaration_name_node(&node)
+            && byte_offset >= name_node.start_byte()
+            && byte_offset < name_node.end_byte()
+            && node_text(name_node, source).is_some_and(|name| symbol_query_matches(symbol, name))
+        {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
 pub fn collect_symbols(root: Node<'_>, source: &[u8]) -> Vec<Value> {
     collect_symbol_candidates(root, source)
         .into_iter()
         .map(|candidate| {
-            let start_pos = candidate.node.start_position();
-            let end_pos = candidate.node.end_position();
+            let declaration = symbol_declaration_node(candidate.node);
+            let start_pos = declaration.start_position();
+            let end_pos = declaration.end_position();
             json!({
                 "name": candidate.name,
                 "qualified_name": candidate.qualified_name,
                 "kind": candidate.node.kind(),
                 "start_line": start_pos.row + 1,
                 "end_line": end_pos.row + 1,
-                "signature": first_line_preview(candidate.node, source, 160),
+                "signature": first_line_preview(declaration, source, 160),
                 "parent": candidate.parent
             })
         })
@@ -806,13 +869,31 @@ fn collect_symbol_candidates_recursive<'a>(
         && let Some(name) = declaration_name(&node, source)
     {
         let name_segments = symbol_segments(name);
-        let qualified_segments = append_qualified_segments(parent_segments, &name_segments);
+        let receiver_name = (node.kind() == "method_declaration")
+            .then(|| node.child_by_field_name("receiver"))
+            .flatten()
+            .and_then(|receiver| receiver.named_child(0))
+            .and_then(|parameter| parameter.child_by_field_name("type"))
+            .and_then(|receiver_type| node_text(receiver_type, source))
+            .map(|receiver_type| {
+                receiver_type
+                    .trim_start_matches('*')
+                    .split('[')
+                    .next()
+                    .unwrap_or(receiver_type)
+                    .to_string()
+            });
+        let mut parent = parent_segments.to_vec();
+        if let Some(receiver_name) = &receiver_name {
+            parent.push(receiver_name.clone());
+        }
+        let qualified_segments = append_qualified_segments(&parent, &name_segments);
         let qualified_name = qualified_segments.join(".");
         candidates.push(SymbolCandidate {
             node,
             name: name.to_string(),
             qualified_name,
-            parent: parent_segments.last().cloned(),
+            parent: parent.last().cloned(),
         });
         child_parent_segments = qualified_segments;
     }

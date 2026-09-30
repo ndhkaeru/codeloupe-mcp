@@ -34,6 +34,7 @@ lazy_static::lazy_static! {
     static ref INDEX_STORE_OPEN_LOCK: Mutex<()> = Mutex::new(());
     static ref RUNTIME_LOAD_LOCK: Mutex<()> = Mutex::new(());
     static ref ACTIVE_INDEX_LOADS: DashMap<String, ()> = DashMap::new();
+    static ref DISABLED_WORKSPACES: DashMap<String, ()> = DashMap::new();
     static ref TANTIVY_SEARCHERS: DashMap<String, Arc<TantivySearchStore>> = DashMap::new();
     static ref TANTIVY_WRITE_LOCKS: DashMap<String, Arc<Mutex<()>>> = DashMap::new();
     static ref ACTIVE_REFRESHES: DashMap<String, ()> = DashMap::new();
@@ -859,6 +860,7 @@ pub fn schedule_workspace_index(workspace_root: PathBuf, workspace_source: Strin
         return;
     }
     let workspace_key = normalize_path_for_identity(&workspace_root);
+    DISABLED_WORKSPACES.remove(&workspace_key);
     record_runtime_access(&workspace_key);
     if ACTIVE_INDEX_LOADS
         .insert(workspace_key.clone(), ())
@@ -891,9 +893,12 @@ pub fn ensure_workspace_index(workspace_root: PathBuf, workspace_source: String)
     }
 
     let workspace_key = normalize_path_for_identity(&workspace_root);
+    if DISABLED_WORKSPACES.contains_key(&workspace_key) {
+        return;
+    }
     set_active_workspace(&workspace_key);
 
-    let first_seen = ensure_runtime_loaded(&workspace_key, &workspace_root, &workspace_source);
+    ensure_runtime_loaded(&workspace_key, &workspace_root, &workspace_source);
     record_request_source(&workspace_key, &workspace_source);
     let storage_dir = index_storage_dir_for_workspace(&workspace_root);
     if storage_dir.is_dir()
@@ -908,7 +913,7 @@ pub fn ensure_workspace_index(workspace_root: PathBuf, workspace_source: String)
 
     let now = current_unix_timestamp();
     let should_refresh = match INDEX_RUNTIMES.read() {
-        Ok(guard) => guard.get(&workspace_key).is_none_or(|state| {
+        Ok(guard) => guard.get(&workspace_key).is_some_and(|state| {
             if state.refresh_running {
                 return false;
             }
@@ -920,7 +925,7 @@ pub fn ensure_workspace_index(workspace_root: PathBuf, workspace_source: String)
                 .map(|timestamp| now.saturating_sub(timestamp) >= stale_index_after_secs())
                 .unwrap_or(true)
         }),
-        Err(_) => first_seen,
+        Err(_) => false,
     };
 
     if should_refresh && refresh_interval_elapsed(&workspace_key, now) {
@@ -999,6 +1004,9 @@ fn ensure_runtime_loaded(
             return false;
         }
     };
+    if DISABLED_WORKSPACES.contains_key(workspace_key) {
+        return false;
+    }
     if INDEX_RUNTIMES
         .read()
         .ok()
@@ -1352,6 +1360,9 @@ fn load_existing_json_index(
 }
 
 fn spawn_full_metadata_refresh(workspace_root: PathBuf, workspace_key: String) {
+    if DISABLED_WORKSPACES.contains_key(&workspace_key) {
+        return;
+    }
     if ACTIVE_REFRESHES.insert(workspace_key.clone(), ()).is_some() {
         return;
     }
@@ -3239,6 +3250,10 @@ pub fn workspace_decisions_path() -> PathBuf {
 pub fn remove_workspace_index(workspace_root: &Path) -> Result<(), String> {
     let workspace_root = canonicalize_or_original(workspace_root.to_path_buf());
     let workspace_key = normalize_path_for_identity(&workspace_root);
+    DISABLED_WORKSPACES.insert(workspace_key.clone(), ());
+    let _load_guard = RUNTIME_LOAD_LOCK
+        .lock()
+        .map_err(|_| "runtime_load_lock_poisoned".to_string())?;
     if ACTIVE_REFRESHES.contains_key(&workspace_key)
         || ACTIVE_CONTENT_REFRESHES
             .iter()
@@ -3965,6 +3980,40 @@ mod tests {
         assert!(!TANTIVY_SEARCHERS.contains_key(&search_key));
         assert!(!PATH_INDEXES.contains_key(&workspace_key));
         assert!(INDEX_RUNTIMES.read().unwrap().get(&workspace_key).is_none());
+    }
+
+    #[test]
+    fn remove_workspace_index_prevents_delayed_runtime_registration() {
+        let workspace = tempdir().unwrap();
+        let root = canonical_test_root(&workspace);
+        fs::write(root.join("lib.rs"), "fn sample() {}\n").unwrap();
+        let workspace_key = normalize_path_for_identity(&root);
+
+        let load_guard = RUNTIME_LOAD_LOCK.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        schedule_workspace_index(root.clone(), "delayed_remove_test".to_string());
+        while !ACTIVE_INDEX_LOADS.contains_key(&workspace_key) {
+            assert!(Instant::now() < deadline, "index loader did not start");
+            thread::yield_now();
+        }
+
+        let remove_root = root.clone();
+        let remover = thread::spawn(move || remove_workspace_index(&remove_root));
+        while !DISABLED_WORKSPACES.contains_key(&workspace_key) {
+            assert!(Instant::now() < deadline, "index removal did not start");
+            thread::yield_now();
+        }
+        drop(load_guard);
+
+        remover.join().unwrap().unwrap();
+        while ACTIVE_INDEX_LOADS.contains_key(&workspace_key) {
+            assert!(Instant::now() < deadline, "index loader did not finish");
+            thread::yield_now();
+        }
+
+        assert!(INDEX_RUNTIMES.read().unwrap().get(&workspace_key).is_none());
+        assert!(!index_storage_dir_for_workspace(&root).exists());
+        DISABLED_WORKSPACES.remove(&workspace_key);
     }
 
     #[test]

@@ -11,7 +11,7 @@ pub fn schema() -> Value {
     json!({
         "name": "list_imports",
         "title": "List imports",
-        "description": "List imports from one Rust, JavaScript/TypeScript, Swift, or Objective-C file. Use to understand dependencies before deeper reads or edits.",
+        "description": "List imports from one supported Rust, JavaScript/TypeScript, Swift, Objective-C, Python, Go, Java, or C# file.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -38,9 +38,13 @@ pub async fn execute(args: &Value) -> Result<Value> {
             | LanguageKind::JavaScript
             | LanguageKind::Swift
             | LanguageKind::ObjectiveC
+            | LanguageKind::Python
+            | LanguageKind::Go
+            | LanguageKind::Java
+            | LanguageKind::CSharp
     ) {
         return Err(anyhow::anyhow!(
-            "list_imports currently supports Rust, JavaScript/TypeScript, Swift, and Objective-C files"
+            "list_imports does not support this language"
         ));
     }
 
@@ -137,6 +141,47 @@ fn collect_imports_recursive(
                     "kind": if is_import { "import" } else { "include" },
                     "source": path_value,
                     "statement": trimmed
+                }));
+            }
+        }
+        LanguageKind::Python
+            if matches!(node.kind(), "import_statement" | "import_from_statement") =>
+        {
+            if let Some(statement) = node_text(node, source) {
+                imports.push(json!({
+                    "line": node.start_position().row + 1,
+                    "kind": if node.kind() == "import_from_statement" { "from" } else { "import" },
+                    "source": statement.trim(),
+                }));
+            }
+        }
+        LanguageKind::Go if node.kind() == "import_spec" => {
+            if let Some(statement) = node_text(node, source) {
+                let source_value = child_field_text(&node, "path", source)
+                    .map(normalized_string_literal)
+                    .unwrap_or_else(|| statement.trim().trim_matches('"').to_string());
+                imports.push(json!({
+                    "line": node.start_position().row + 1,
+                    "kind": "import",
+                    "source": source_value,
+                }));
+            }
+        }
+        LanguageKind::Java if node.kind() == "import_declaration" => {
+            if let Some(statement) = node_text(node, source) {
+                imports.push(json!({
+                    "line": node.start_position().row + 1,
+                    "kind": "import",
+                    "source": statement.trim().trim_start_matches("import ").trim_end_matches(';'),
+                }));
+            }
+        }
+        LanguageKind::CSharp if node.kind() == "using_directive" => {
+            if let Some(statement) = node_text(node, source) {
+                imports.push(json!({
+                    "line": node.start_position().row + 1,
+                    "kind": "using",
+                    "source": statement.trim().trim_start_matches("using ").trim_end_matches(';'),
                 }));
             }
         }

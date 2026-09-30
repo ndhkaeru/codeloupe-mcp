@@ -4,14 +4,15 @@ use serde_json::{Value, json};
 use tree_sitter::Node;
 
 use crate::tools::ast_support::{
-    DEFAULT_AST_FILE_SIZE_LIMIT, LanguageKind, declaration_name, node_text, parse_supported_file,
+    DEFAULT_AST_FILE_SIZE_LIMIT, LanguageKind, collect_symbol_candidates, declaration_name,
+    node_text, parse_supported_file,
 };
 
 pub fn schema() -> Value {
     json!({
         "name": "list_exports",
         "title": "List exports",
-        "description": "List public exports from one Rust, JavaScript/TypeScript, Swift, or Objective-C file. Use to understand module API surface quickly.",
+        "description": "List public declarations from supported Rust, JavaScript/TypeScript, Swift, Objective-C, Python, Go, Java, or C# files. Python uses the public-name convention; Go uses exported identifiers.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -38,19 +39,35 @@ pub async fn execute(args: &Value) -> Result<Value> {
             | LanguageKind::JavaScript
             | LanguageKind::Swift
             | LanguageKind::ObjectiveC
+            | LanguageKind::Python
+            | LanguageKind::Go
+            | LanguageKind::Java
+            | LanguageKind::CSharp
     ) {
         return Err(anyhow::anyhow!(
-            "list_exports currently supports Rust, JavaScript/TypeScript, Swift, and Objective-C files"
+            "list_exports does not support this language"
         ));
     }
 
     let mut exports = Vec::new();
-    collect_exports_recursive(
-        parsed.tree.root_node(),
+    if matches!(
         parsed.language_kind,
-        &parsed.source,
-        &mut exports,
-    );
+        LanguageKind::Python | LanguageKind::Go | LanguageKind::Java | LanguageKind::CSharp
+    ) {
+        collect_public_symbols(
+            parsed.tree.root_node(),
+            parsed.language_kind,
+            &parsed.source,
+            &mut exports,
+        );
+    } else {
+        collect_exports_recursive(
+            parsed.tree.root_node(),
+            parsed.language_kind,
+            &parsed.source,
+            &mut exports,
+        );
+    }
 
     Ok(json!({
         "path": crate::common::normalize_display_path(&path),
@@ -63,6 +80,53 @@ pub async fn execute(args: &Value) -> Result<Value> {
         },
         "total_exports": exports.len()
     }))
+}
+
+fn collect_public_symbols(
+    root: Node<'_>,
+    language_kind: LanguageKind,
+    source: &[u8],
+    exports: &mut Vec<Value>,
+) {
+    for candidate in collect_symbol_candidates(root, source) {
+        let name = candidate.name.as_str();
+        let statement = node_text(candidate.node, source)
+            .unwrap_or("")
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("");
+        let declaration = node_text(candidate.node, source).unwrap_or("");
+        let is_public = match language_kind {
+            LanguageKind::Python => {
+                let parent = candidate.node.parent();
+                let module_level = parent.is_some_and(|node| node.kind() == "module")
+                    || parent.is_some_and(|node| {
+                        node.kind() == "decorated_definition"
+                            && node
+                                .parent()
+                                .is_some_and(|grandparent| grandparent.kind() == "module")
+                    });
+                module_level && !name.starts_with('_')
+            }
+            LanguageKind::Go => name.chars().next().is_some_and(char::is_uppercase),
+            LanguageKind::Java | LanguageKind::CSharp => declaration
+                .split(['{', ';'])
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .any(|word| word == "public"),
+            _ => false,
+        };
+        if is_public {
+            exports.push(json!({
+                "line": candidate.node.start_position().row + 1,
+                "kind": candidate.node.kind(),
+                "name": name,
+                "statement": statement,
+            }));
+        }
+    }
 }
 
 fn collect_exports_recursive(

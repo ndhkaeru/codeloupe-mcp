@@ -17,14 +17,23 @@
   },
   "files": [
     "bin/",
-    "native/",
     "README.md",
     "LICENSE"
   ],
+  "optionalDependencies": {
+    "@ndhkaeru/codeloupe-mcp-darwin-arm64": "1.1.0",
+    "@ndhkaeru/codeloupe-mcp-darwin-x64": "1.1.0",
+    "@ndhkaeru/codeloupe-mcp-linux-arm64": "1.1.0",
+    "@ndhkaeru/codeloupe-mcp-linux-x64": "1.1.0",
+    "@ndhkaeru/codeloupe-mcp-win32-arm64": "1.1.0",
+    "@ndhkaeru/codeloupe-mcp-win32-x64": "1.1.0"
+  },
   "scripts": {
     "prepare:native": "node scripts/prepare-npm-assets.js",
-    "smoke": "node bin/codeloupe-mcp.js --version",
-    "test:env": "node scripts/test-env-aliases.js"
+    "smoke": "node scripts/smoke.js",
+    "test:env": "node scripts/test-env-aliases.js",
+    "test:layout": "node scripts/test-package-layout.js && node scripts/test-launcher-resolution.js",
+    "test:packed": "node scripts/test-packed-install.js"
   },
   "engines": {
     "node": ">=18"

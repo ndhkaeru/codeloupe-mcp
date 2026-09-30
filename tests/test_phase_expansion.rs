@@ -8,6 +8,85 @@ use std::fs;
 use tempfile::tempdir;
 
 #[tokio::test]
+async fn test_variable_functions_are_symbols_definitions_and_call_graph_roots() {
+    let dir = tempdir().unwrap();
+    for extension in ["js", "ts", "tsx"] {
+        let path = dir.path().join(format!("functions.{extension}"));
+        fs::write(
+            &path,
+            "const arrow = () => helper();\nconst expression = function() { return helper(); };\nexport const asyncArrow = async () => helper();\nconst literal = 123;\n",
+        )
+        .unwrap();
+        let symbols = get_symbols::execute(&json!({"path": path})).await.unwrap();
+        for (name, prefix) in [
+            ("arrow", "const arrow ="),
+            ("expression", "const expression ="),
+            ("asyncArrow", "export const asyncArrow ="),
+        ] {
+            let entry = symbols["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap();
+            assert!(
+                entry["signature"].as_str().unwrap().starts_with(prefix),
+                "{extension}: {entry}"
+            );
+            let body = read_symbol_body::execute(&json!({
+                "symbol": name, "paths": [path], "file_hint": path,
+            }))
+            .await
+            .unwrap();
+            assert!(
+                body["content"].as_str().unwrap().starts_with(prefix),
+                "{extension}: {body}"
+            );
+            assert_eq!(body["start_line"], entry["start_line"]);
+        }
+        for name in ["arrow", "expression", "asyncArrow"] {
+            assert!(
+                symbols["symbols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["name"] == name),
+                "{extension}: missing {name}: {symbols}"
+            );
+            let definition = find_definition::execute(&json!({
+                "symbol": name, "paths": [path]
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                definition["total_returned"], 1,
+                "{extension}: {name}: {definition}"
+            );
+            let graph = get_call_graph::execute(&json!({
+                "symbol": name, "file_path": path
+            }))
+            .await
+            .unwrap();
+            assert!(
+                graph["outbound_calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|call| call == "helper"),
+                "{extension}: {name}: {graph}"
+            );
+        }
+        assert!(
+            !symbols["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["name"] == "literal")
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_create_directory_supports_nested_creation_and_existing_behavior() {
     let dir = tempdir().unwrap();
     workspace_control::register_configured_workspace(
@@ -593,6 +672,17 @@ async fn test_find_references_classifies_code_comments_and_strings_with_ast() {
         })
         .collect::<Vec<_>>();
     assert_eq!(kinds, vec!["code", "code", "string", "comment"]);
+    assert_eq!(
+        references[0]
+            .get("is_definition")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert!(
+        references[1..]
+            .iter()
+            .all(|reference| reference.get("is_definition").is_none())
+    );
     assert!(
         references
             .iter()

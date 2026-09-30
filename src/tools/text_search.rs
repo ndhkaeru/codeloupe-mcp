@@ -7,6 +7,7 @@ use ignore::{WalkBuilder, WalkState};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,9 +18,9 @@ use tokio::task;
 use super::output_format::{OutputFormat, parse_output_format};
 use super::path_filters::{
     Pattern, apply_walk_overrides, compile_patterns, configure_walk_filters,
-    default_generated_vendor_globs, filtered_scope_warnings, is_direct_vendor_or_generated_scope,
-    is_vcs_metadata_dir, matches_patterns_or_ancestors, parse_pattern_strings,
-    passes_patterns as path_passes_patterns,
+    default_generated_vendor_globs, filtered_scope_warnings_with_defaults,
+    is_direct_vendor_or_generated_scope, is_vcs_metadata_dir, matches_patterns_or_ancestors,
+    parse_pattern_strings, passes_patterns as path_passes_patterns,
 };
 use super::search_snippet::{render_line_start, render_match_line};
 use crate::cancellation::CancellationToken;
@@ -237,6 +238,9 @@ fn execute_blocking(args: Value) -> Result<Value> {
     }
 
     let mode = parse_mode(args.get("mode").and_then(|v| v.as_str()))?;
+    if args.get("case_sensitive").is_some() && args.get("case_mode").is_some() {
+        anyhow::bail!("Conflicting case_sensitive and case_mode: choose only one case option");
+    }
     let case_mode = parse_case_mode(
         args.get("case_mode").and_then(|v| v.as_str()),
         args.get("case_sensitive").and_then(|v| v.as_bool()),
@@ -294,7 +298,8 @@ fn execute_blocking(args: Value) -> Result<Value> {
         SearchMode::Literal => regex::escape(query),
         SearchMode::Regex => query.to_string(),
     });
-    build_matcher(&pattern, case_sensitive_effective).context("Invalid search query")?;
+    build_matcher(&pattern, case_sensitive_effective)
+        .map_err(|error| anyhow::anyhow!("Invalid search query: {error:#}"))?;
 
     let includes_applied = !includes.is_empty();
     let excludes_applied = !excludes.is_empty();
@@ -346,7 +351,7 @@ fn execute_blocking(args: Value) -> Result<Value> {
 
         if content_index_used {
             let matcher = build_matcher(&pattern, case_sensitive_effective)
-                .context("Invalid search query")?;
+                .map_err(|error| anyhow::anyhow!("Invalid search query: {error:#}"))?;
             index_candidates_searched = true;
             search_index_candidate_paths(
                 index_result.paths,
@@ -472,7 +477,10 @@ fn execute_blocking(args: Value) -> Result<Value> {
             "includes_applied": includes_applied,
             "excludes_applied": excludes_applied,
             "default_excludes_applied": default_excludes_applied,
-            "default_excludes": default_exclude_globs,
+            "default_excludes": default_exclude_globs.iter()
+                .filter_map(|pattern| pattern.strip_suffix("/**"))
+                .filter(|name| !name.contains('/'))
+                .collect::<Vec<_>>(),
             "fallback_reason": fallback_reasons
         }))
     } else {
@@ -532,10 +540,11 @@ fn execute_blocking(args: Value) -> Result<Value> {
     }
     let mut warnings = search_scope_warnings(&input_paths, search_strategy);
     if max_results > 0 && total_returned == 0 && !suppress_filter_hints {
-        warnings.extend(filtered_scope_warnings(
+        warnings.extend(filtered_scope_warnings_with_defaults(
             &input_paths,
             include_ignored,
             include_hidden,
+            default_excludes_applied,
         ));
         warnings.sort();
         warnings.dedup();
@@ -1076,15 +1085,25 @@ fn search_candidate(
     let candidate_path = candidate.path.clone();
     let display_path = normalize_path(&candidate_path);
 
+    let mut decoded_searcher = match file_needs_windows_1252(&candidate_path) {
+        Ok(true) => Some(build_windows_1252_searcher(searcher.before_context())),
+        Ok(false) => None,
+        Err(_) => {
+            shared.search_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    let active_searcher = decoded_searcher.as_mut().unwrap_or(searcher);
+
     let mut sink = MatchSink::new(
         matcher,
         max_results,
         max_line_length,
-        searcher.before_context(),
-        searcher.after_context(),
+        active_searcher.before_context(),
+        active_searcher.after_context(),
         shared.cancellation.clone(),
     );
-    if searcher
+    if active_searcher
         .search_path(matcher, &candidate_path, &mut sink)
         .is_err()
     {
@@ -1281,6 +1300,51 @@ fn build_searcher(context_lines: usize) -> Searcher {
         .build()
 }
 
+fn build_windows_1252_searcher(context_lines: usize) -> Searcher {
+    SearcherBuilder::new()
+        .encoding(Some(
+            grep_searcher::Encoding::new("windows-1252").expect("valid encoding"),
+        ))
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .line_number(true)
+        .before_context(context_lines)
+        .after_context(context_lines)
+        .build()
+}
+
+fn file_needs_windows_1252(path: &Path) -> std::io::Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0u8; 8192];
+    let mut pending = Vec::new();
+    let mut first_chunk = true;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(!pending.is_empty());
+        }
+        if first_chunk {
+            first_chunk = false;
+            if buffer[..count].starts_with(&[0xef, 0xbb, 0xbf])
+                || buffer[..count].starts_with(&[0xff, 0xfe])
+                || buffer[..count].starts_with(&[0xfe, 0xff])
+            {
+                return Ok(false);
+            }
+        }
+        if buffer[..count].contains(&0) {
+            return Ok(false);
+        }
+        pending.extend_from_slice(&buffer[..count]);
+        match std::str::from_utf8(&pending) {
+            Ok(_) => pending.clear(),
+            Err(error) if error.error_len().is_some() => return Ok(true),
+            Err(error) => {
+                pending.drain(..error.valid_up_to());
+            }
+        }
+    }
+}
+
 fn merge_shared_stats(shared: &SharedSearchState, stats: &mut SearchStats) {
     stats.files_considered = shared.files_considered.load(Ordering::Relaxed);
     stats.files_searched = shared.files_searched.load(Ordering::Relaxed);
@@ -1434,7 +1498,10 @@ fn indexed_file_count_is_large(indexed_files: Option<usize>) -> bool {
     indexed_files.is_some_and(|count| count > crate::indexer::LARGE_WORKSPACE_FILE_THRESHOLD)
 }
 
-fn default_fallback_excludes(input_paths: &[PathBuf], user_excludes: &[String]) -> Vec<String> {
+pub(super) fn default_fallback_excludes(
+    input_paths: &[PathBuf],
+    user_excludes: &[String],
+) -> Vec<String> {
     if input_paths
         .iter()
         .any(|path| is_direct_vendor_or_generated_scope(path.as_path()))

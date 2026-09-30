@@ -26,6 +26,7 @@ pub fn schema() -> Value {
                 "max_results": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Maximum returned results per group. Defaults to 20." },
                 "max_line_length": { "type": "integer", "minimum": 1, "maximum": 4000, "description": "Maximum text and symbol snippet characters. Defaults to 240." },
                 "text_mode": { "type": "string", "enum": ["literal", "regex"], "description": "Text-search mode. Defaults to literal." },
+                "mode": { "type": "string", "enum": ["literal", "regex"], "description": "Alias for text_mode; do not pass both." },
                 "case_mode": { "type": "string", "enum": ["insensitive", "sensitive", "smart"], "description": "Text-search case handling. Defaults to smart." },
                 "includes": { "type": "array", "items": { "type": "string" }, "description": "Text-search include globs relative to the searched roots." },
                 "excludes": { "type": "array", "items": { "type": "string" }, "description": "Text-search exclude globs relative to the searched roots." },
@@ -162,14 +163,21 @@ pub async fn execute(args: &Value) -> Result<Value> {
                 .expect("search_workspace response always contains groups"),
         )
     {
-        let warnings = super::path_filters::filtered_scope_warnings(
-            &resolved_search_paths(args),
+        let search_paths = resolved_search_paths(args);
+        let default_excludes_applied = !super::text_search::default_fallback_excludes(
+            &search_paths,
+            &super::path_filters::parse_pattern_strings(args.get("excludes")),
+        )
+        .is_empty();
+        let warnings = super::path_filters::filtered_scope_warnings_with_defaults(
+            &search_paths,
             args.get("include_ignored")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             args.get("include_hidden")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            default_excludes_applied,
         );
         if !warnings.is_empty() {
             crate::common::insert_object_field(&mut response, "warnings", json!(warnings));

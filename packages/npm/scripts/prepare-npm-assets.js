@@ -11,13 +11,18 @@ const OWNER = process.env.GITHUB_REPOSITORY_OWNER || 'ndhkaeru';
 const REPO = (process.env.GITHUB_REPOSITORY || 'ndhkaeru/codeloupe-mcp').split('/')[1] || 'codeloupe-mcp';
 const TAG = process.env.GITHUB_REF_NAME || process.argv[2] || 'latest';
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
+const REPOSITORY_ROOT = path.resolve(PACKAGE_ROOT, '..', '..');
 const NATIVE_DIR = path.join(PACKAGE_ROOT, 'native');
+const PLATFORM_PACKAGES_ROOT = path.resolve(PACKAGE_ROOT, '..', 'npm-platforms');
+const PLATFORM_README = path.join(PLATFORM_PACKAGES_ROOT, 'README.md');
+const LICENSE = path.join(REPOSITORY_ROOT, 'LICENSE');
+const MAIN_PACKAGE = require(path.join(PACKAGE_ROOT, 'package.json'));
 
 const TARGETS = [
   ['darwin-arm64', 'aarch64-apple-darwin', 'codeloupe-mcp'],
   ['darwin-x64', 'x86_64-apple-darwin', 'codeloupe-mcp'],
-  ['linux-arm64', 'aarch64-unknown-linux-gnu', 'codeloupe-mcp'],
-  ['linux-x64', 'x86_64-unknown-linux-gnu', 'codeloupe-mcp'],
+  ['linux-arm64', 'aarch64-unknown-linux-musl', 'codeloupe-mcp'],
+  ['linux-x64', 'x86_64-unknown-linux-musl', 'codeloupe-mcp'],
   ['win32-arm64', 'aarch64-pc-windows-msvc', 'codeloupe-mcp.exe'],
   ['win32-x64', 'x86_64-pc-windows-msvc', 'codeloupe-mcp.exe'],
 ];
@@ -90,7 +95,6 @@ function extract(archivePath, outputDir) {
 
 async function main() {
   fs.rmSync(NATIVE_DIR, { recursive: true, force: true });
-  fs.mkdirSync(NATIVE_DIR, { recursive: true });
 
   const releaseUrl = TAG === 'latest'
     ? `https://api.github.com/repos/${OWNER}/${REPO}/releases/latest`
@@ -98,6 +102,20 @@ async function main() {
   const release = await requestJson(releaseUrl);
 
   for (const [platformKey, triple, exeName] of TARGETS) {
+    const packageDir = path.join(PLATFORM_PACKAGES_ROOT, platformKey);
+    const packageJsonPath = path.join(packageDir, 'package.json');
+    const platformPackage = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    const expectedPackageName = `@ndhkaeru/codeloupe-mcp-${platformKey}`;
+    if (platformPackage.name !== expectedPackageName) {
+      throw new Error(`${packageJsonPath} has name ${platformPackage.name}; expected ${expectedPackageName}`);
+    }
+    if (platformPackage.version !== MAIN_PACKAGE.version) {
+      throw new Error(`${platformPackage.name} version ${platformPackage.version} does not match ${MAIN_PACKAGE.version}`);
+    }
+    if (MAIN_PACKAGE.optionalDependencies?.[platformPackage.name] !== MAIN_PACKAGE.version) {
+      throw new Error(`${platformPackage.name} is missing from optionalDependencies at ${MAIN_PACKAGE.version}`);
+    }
+
     const asset = release.assets.find((item) =>
       item.name.includes(triple) && (item.name.endsWith('.zip') || item.name.endsWith('.tar.xz') || item.name.endsWith('.tar.gz'))
     );
@@ -111,11 +129,14 @@ async function main() {
     const binary = listFiles(tempDir).find((file) => path.basename(file) === exeName);
     if (!binary) throw new Error(`Could not find ${exeName} in ${asset.name}`);
 
-    const outDir = path.join(NATIVE_DIR, platformKey);
+    const outDir = path.join(packageDir, 'bin');
+    fs.rmSync(outDir, { recursive: true, force: true });
     fs.mkdirSync(outDir, { recursive: true });
     const outPath = path.join(outDir, exeName);
     fs.copyFileSync(binary, outPath);
     if (process.platform !== 'win32') fs.chmodSync(outPath, 0o755);
+    fs.copyFileSync(LICENSE, path.join(packageDir, 'LICENSE'));
+    fs.copyFileSync(PLATFORM_README, path.join(packageDir, 'README.md'));
     console.log(`prepared ${platformKey}: ${outPath}`);
   }
 }

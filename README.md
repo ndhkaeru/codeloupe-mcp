@@ -415,7 +415,7 @@ Follow Windsurf's MCP documentation and use the standard config:
 
 ### Configuration
 
-`codeloupe-mcp` accepts repeatable `--workspace <path>` / `--workspace=<path>` arguments and environment variables in the MCP server process. Explicit CLI and environment workspaces are approved for indexing unless index mode is `off`.
+`codeloupe-mcp` accepts repeatable `--workspace <path>` / `--workspace=<path>` arguments and environment variables in the MCP server process. Explicit CLI and environment workspaces are approved for indexing unless index mode is `off`. `--help` and `--version` print immediately without starting the stdio server; unknown CLI options fail instead of silently starting it.
 
 After upgrading the server, reconnect or restart the MCP client so it fetches the current `tools/list` schema. Long-running clients such as Claude Code can keep the previous session's tool parameters until they reconnect.
 
@@ -497,13 +497,13 @@ With `target_line_ending="preserve"`, `edit_file` normalizes appended, prepended
 
 Successful write responses are compact and omit redundant `success`, `message`, and default-valued status fields. File mutations return `path`, `history_entry_id`, and `sha256_after` when a file exists after the operation, plus operation-specific fields such as `replacements`, `bytes_removed`, or `undone_entry_id`; exceptional conditions are reported only when they occur. `edit_files` applies the same contract to each changed file instead of repeating default encoding, validation, and history metadata.
 
-Write authorization uses the `warning_only` scope. Paths inside exact declared MCP/CLI/environment roots are written without a location warning. Other write targets are not blocked by server policy; responses attach one short risk warning based on the highest detected risk: `low` outside known write roots, `medium` elsewhere in an inferred repository, `high` for configured sensitive patterns, and `critical` for `.git`, sensitive home credential/profile locations, protected operating-system directories, or symlink/junction escapes. Filesystem permissions and normal tool preconditions can still reject an operation. History entries outside declared roots include `outside_declared: true`; `workspace_index` controls indexing only and does not declare a write root.
+Write authorization uses the `risk_aware` scope. Paths inside exact declared MCP/CLI/environment roots are written without a location warning. Other targets receive one short warning based on the highest detected risk: `low` outside known write roots, `medium` elsewhere in an inferred repository, `high` for configured sensitive patterns or a detected symlink/junction target, and `critical` for `.git`, sensitive home credential/profile locations, protected operating-system directories, or canonical escapes from a declared root/repository. Low, medium, and high-risk writes proceed immediately. A critical-risk call returns `risk_confirmation_required` before mutation; retry the same call with `acknowledge_risk=true` to proceed while retaining the warning. Sensitive hash-mismatch responses do not expose `actual_hash`. History entries outside declared roots include `outside_declared: true`; `workspace_index` controls indexing only and does not declare a write root.
 
 `validate_json` performs streaming syntax validation without materializing the document. It accepts exactly one UTF-8 file path or inline JSON string, reports parser line/column details for invalid input, and does not perform JSON Schema validation.
 
 Write history is in memory and local to the running server process. It retains at most 200 entries and 256 MiB of snapshot bytes, evicting the oldest entries first. `list_history` returns metadata only, and `undo_change` refuses to overwrite a path whose current contents or canonical location no longer match the recorded after-snapshot. History does not survive a server restart.
 
-`read_file_range` supports line ranges, `tail` for the final N lines, bounded `start_byte` windows for very long lines, and streaming `json_pointer` selection using RFC 6901. Text responses remove a leading BOM, normalize CRLF and classic CR line endings to LF, report `bom`/`is_binary`, and never return NUL-containing binary content. `start_byte` defaults to a 64 KiB window when `max_bytes` is omitted; `json_pointer` defaults to a 1 MiB serialized-value budget. `read_snippets` accepts the same per-request selectors and returns line- or byte-based continuations.
+`read_file_range` supports line ranges, `tail` for the final N lines, bounded `start_byte` windows for very long lines, and streaming `json_pointer` selection using RFC 6901. Text responses remove a leading BOM, normalize CRLF and classic CR line endings to LF, report `bom`/`is_binary`, and never return NUL-containing binary content. Line, tail, and `start_byte` reads default to a 64 KiB output window when `max_bytes` is omitted; oversized first lines return a prefix with `line_truncated: true` and `next_start_byte`. `json_pointer` defaults to a 1 MiB serialized-value budget. `read_snippets` accepts the same per-request selectors and returns line- or byte-based continuations.
 
 </details>
 
@@ -526,7 +526,7 @@ Literal `text_search` uses Tantivy only to shortlist files, then always runs exa
 
 `text_search` accepts `output_format="json" | "markdown" | "compact"`. Markdown and compact text group matches by file and emit one line per match. All formats return a shared `root`, use paths relative to that root, report `complete`, and omit detailed diagnostics on normal complete results unless `verbose=true`.
 
-`project_map`, `fuzzy_find`, `text_search`, `workspace_stats`, `find_definition`, `find_references`, and `search_workspace` accept `include_ignored=true` to include paths filtered by `.gitignore`, `.git/info/exclude`, global gitignore, or `.ignore` files. The same tools accept `include_hidden=true` to include hidden files and directories. Inclusive scans bypass metadata/content indexes and use a filesystem walk. VCS metadata directories such as `.git`, `.hg`, and `.svn` remain excluded from root scans even with `include_hidden=true`, but an explicitly scoped hidden or ignored path remains searchable. Zero-result searches add bounded diagnostics when ignored or hidden entries were skipped and suggest the relevant inclusive flag. Search/discovery responses expose consistent `index_used`, `index_complete`, and `index_age_secs` fields. `project_map` tree keys are relative to `root` (`.` is the root directory); each key maps to separate `dirs` and `files` arrays so entries do not repeat a constant type field. File entries include `size_bytes` only when `show_sizes=true`. `fuzzy_find` result `path` values are relative to its single shared `root`; detailed traversal counters, timestamps, fallback reasons, skipped-item details, and warnings move under `diagnostics` when `complete=false` or `verbose=true`.
+`project_map`, `fuzzy_find`, `text_search`, `workspace_stats`, `find_definition`, `find_references`, and `search_workspace` accept `include_ignored=true` to include paths filtered by `.gitignore`, `.git/info/exclude`, global gitignore, or `.ignore` files. The same tools accept `include_hidden=true` to include hidden files and directories. Tools whose schema uses `paths` also accept `path` as a singular alias; passing both is an error. Inclusive scans bypass metadata/content indexes and use a filesystem walk. VCS metadata directories such as `.git`, `.hg`, and `.svn` remain excluded from root scans even with `include_hidden=true`, but an explicitly scoped hidden or ignored path remains searchable. Zero-result searches add bounded diagnostics when ignored or hidden entries were skipped and suggest the relevant inclusive flag. Search/discovery responses expose consistent `index_used`, `index_complete`, and `index_age_secs` fields. `project_map` tree keys are relative to `root` (`.` is the root directory); each key maps to separate `dirs` and `files` arrays so entries do not repeat a constant type field. Directory symlinks/junctions are represented in `dirs` without being traversed. File entries include `size_bytes` only when `show_sizes=true`. `fuzzy_find` result `path` values are relative to its single shared `root`; detailed traversal counters, timestamps, fallback reasons, skipped-item details, and warnings move under `diagnostics` when `complete=false` or `verbose=true`.
 
 `workspace_stats` reports bounded `excluded_files.ignored` and `excluded_files.hidden` counts when default filters omit files. `counts_complete=false` means those counts are lower bounds because the filter probe reached its 50,000-file cap.
 
@@ -554,7 +554,7 @@ Eligible multi-file scan responses may include `index_advice` when an unapproved
 
 Symbol queries accept both `Class.method` and `Class::method`, including deeper qualified names. `get_symbols` returns `qualified_name` and `start_line`; `read_symbol_body`, `get_call_graph`, and each `compare_symbols` side accept an optional `line` selector. An unqualified query with multiple AST matches returns `ambiguous: true` plus `candidates` instead of silently selecting the first match. `compare_symbols` omits `same_content` and `unified_diff` when either side is ambiguous.
 
-`find_definition` uses Tree-sitter for supported languages, matches symbol names case-sensitively, and labels those results with `resolution: "ast"`. Unsupported code extensions use a declaration-regex fallback labeled `resolution: "heuristic"`. `find_references` performs token matching rather than binding or type resolution; Tree-sitter-supported files return `match_kind: "code" | "comment" | "string"` with `classification: "ast"`, while unsupported extensions return `match_kind: "unknown"` with `classification: "text_fallback"`.
+`find_definition` uses Tree-sitter for supported languages, matches symbol names case-sensitively, and labels those results with `resolution: "ast"`. Unsupported code extensions use a declaration-regex fallback labeled `resolution: "heuristic"`. `find_references` performs token matching rather than binding or type resolution; Tree-sitter-supported files return `match_kind: "code" | "comment" | "string"` with `classification: "ast"`, mark a declaration-name match with `is_definition: true`, and leave ordinary references unmarked. Unsupported extensions return `match_kind: "unknown"` with `classification: "text_fallback"`.
 
 `find_definition` and `find_references` keep result data plus `complete`/limit metadata at the top level. Scan counters, path-index/filesystem strategy, fallback counts, skipped-file details, and cancellation state appear under `diagnostics` only for incomplete results, zero-result filter hints, or when `verbose=true`. Default per-result metadata is omitted where it can be inferred; for example, ordinary AST code references do not repeat `classification: "ast"`, `match_kind: "code"`, or `line_truncated: false`.
 
@@ -588,7 +588,7 @@ Tool execution failures use a machine-readable `{ "error": { "code", "message" }
 
 `batch_tool_call` executes subcalls sequentially under a 55-second default batch deadline and a shared 1 MiB output budget. Its text payload starts with a compact `summary`; successful results and error messages both consume the fair per-call budget, oversized payloads are replaced with bounded previews, and calls that cannot start are reported as `skipped_deadline`, `skipped_cancelled`, or `skipped_output_budget` instead of disappearing.
 
-`server_health` reports configured workspaces, active workspace context, index candidates and rejection reasons, safety budgets, the total persistent index-root size, and counts of loaded, unloaded, and orphaned workspace indexes. Each configured workspace reports its inferred `workspace_root` separately from exact `declared_roots` and `write_roots`. It reports `write_scope: "warning_only"`; compatibility fields for write elicitation remain disabled and empty. `index_gc` is a dry-run unless `apply=true`; it can target workspace roots and applies the same default retention policy used at startup. Active indexes are protected by cross-process shared locks.
+`server_health` reports configured workspaces, active workspace context, index candidates and rejection reasons, safety budgets, the total persistent index-root size, and counts of loaded, unloaded, and orphaned workspace indexes. Each configured workspace reports its inferred `workspace_root` separately from exact `declared_roots` and `write_roots`. It reports `write_scope: "risk_aware"`; compatibility fields for write elicitation remain disabled and empty. `index_gc` is a dry-run unless `apply=true`; it can target workspace roots and applies the same default retention policy used at startup. Active indexes are protected by cross-process shared locks.
 
 </details>
 
@@ -596,7 +596,7 @@ Tool execution failures use a machine-readable `{ "error": { "code", "message" }
 
 AST-backed tools use Tree-sitter for Rust, C, C++, Go, Java, C#, PHP, Ruby, JavaScript, TypeScript, Python, Swift, and Objective-C.
 
-`list_imports` and `list_exports` currently support Rust, JavaScript/TypeScript, Swift, and Objective-C. File/search/workspace tools work on any text file regardless of language.
+`list_imports` and `list_exports` support Rust, JavaScript/TypeScript, Swift, Objective-C, Python, Go, Java, and C#. Python exports follow the public-name convention (top-level declarations not beginning with `_`); Go exports follow exported-identifier capitalization. File/search/workspace tools work on any text file regardless of language.
 
 ### Shared file limits
 
@@ -646,16 +646,16 @@ Workspace roots are dynamic: explicit CLI/environment roots are approved first; 
 
 Releases are distributed through two channels:
 
-- **GitHub Releases**: a semver tag such as `v1.0.0` builds native archives/installers for macOS, Linux, and Windows on x64/arm64.
-- **npm/npx**: `@ndhkaeru/codeloupe-mcp` publishes a small JavaScript launcher plus native binaries from the matching GitHub Release.
+- **GitHub Releases**: a semver tag such as `v1.0.0` builds native archives/installers for macOS, Linux, and Windows on x64/arm64. Linux archives use static musl targets so they do not require a recent glibc and can run on musl-based distributions such as Alpine.
+- **npm/npx**: `@ndhkaeru/codeloupe-mcp` is a small JavaScript launcher. npm installs one OS/CPU-specific optional package containing only the matching native binary instead of downloading all six platforms.
 
 Release checklist:
 
-1. Update versions in `Cargo.toml`, `Cargo.lock`, `packages/npm/package.json`, and `server.json`.
+1. Update versions in `Cargo.toml`, `Cargo.lock`, `packages/npm/package.json`, every `packages/npm-platforms/*/package.json`, and `server.json`.
 2. Run the checks from `rust.yml`: format, clippy, tests, audit, deny, and typos.
 3. Push `main`, then check GitHub Actions for failures.
 4. Push a semver tag such as `v1.0.0`.
-5. Confirm release and npm publish workflows succeed.
+5. Confirm release assets, all six platform npm packages, and the launcher npm package publish successfully.
 6. Smoke test `npx -y @ndhkaeru/codeloupe-mcp@<version>`.
 
 ### Development

@@ -1,0 +1,12 @@
+{
+  "name": "@ndhkaeru/codeloupe-mcp-darwin-arm64",
+  "version": "1.1.0",
+  "description": "Native codeloupe-mcp binary for macOS arm64",
+  "license": "Apache-2.0",
+  "repository": "github:ndhkaeru/codeloupe-mcp",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public" }
+}

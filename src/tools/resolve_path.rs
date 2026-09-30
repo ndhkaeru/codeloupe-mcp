@@ -36,7 +36,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
         "workspace_root": resolution.workspace_root.map(|root| crate::common::normalize_display_path(&root)),
         "repo_root": repo_root.map(|root| crate::common::normalize_display_path(&root)),
         "tier": "Allowed",
-        "is_accessible": true,
+        "is_accessible": resolution.path.exists() && std::fs::metadata(&resolution.path).is_ok(),
         "exists": resolution.path.exists(),
         "is_file": resolution.path.is_file(),
         "is_dir": resolution.path.is_dir(),

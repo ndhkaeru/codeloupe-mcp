@@ -108,7 +108,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
             "is_binary": true,
             "lines": 0,
             "outline_preview": null,
-            "warning": "This is a binary file."
+            "warnings": ["This is a binary file."]
         }));
     }
 
