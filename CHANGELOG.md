@@ -4,6 +4,8 @@ All notable changes to `codeloupe-mcp` are documented in this file.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-30
+
 ### Security
 
 - Critical-risk writes now stop before mutation and return `risk_confirmation_required`; callers must retry with `acknowledge_risk=true`. Low, medium, and high-risk writes still proceed with warnings.
@@ -13,6 +15,8 @@ All notable changes to `codeloupe-mcp` are documented in this file.
 
 - Bounded default line/tail reads to 64 KiB with byte continuations for oversized lines, and reject byte limits too small to advance a UTF-8 continuation.
 - Added a validated singular `path` alias for plural-path tools, immediate CLI `--help`/`--version`, definition marking in `find_references`, correct directory-link representation in `project_map`, and source-checkout gating for the npm launcher fallback.
+- Reject binary files in single-file editing/conversion, require an explicit whole-file replace mode, and bound JSON-pointer reads to 64 KiB.
+- Restore declaration prefixes for JavaScript/TypeScript variable functions in symbol signatures and bodies, expand import/export support, and clarify invalid-argument errors and search diagnostics.
 
 ### Distribution
 

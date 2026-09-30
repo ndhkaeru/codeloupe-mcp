@@ -1,6 +1,6 @@
 {
   "name": "@ndhkaeru/codeloupe-mcp",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Local-first MCP server for code search, code intelligence, repository comparison, and safe file edits",
   "license": "Apache-2.0",
   "repository": {
@@ -21,12 +21,12 @@
     "LICENSE"
   ],
   "optionalDependencies": {
-    "@ndhkaeru/codeloupe-mcp-darwin-arm64": "1.1.0",
-    "@ndhkaeru/codeloupe-mcp-darwin-x64": "1.1.0",
-    "@ndhkaeru/codeloupe-mcp-linux-arm64": "1.1.0",
-    "@ndhkaeru/codeloupe-mcp-linux-x64": "1.1.0",
-    "@ndhkaeru/codeloupe-mcp-win32-arm64": "1.1.0",
-    "@ndhkaeru/codeloupe-mcp-win32-x64": "1.1.0"
+    "@ndhkaeru/codeloupe-mcp-darwin-arm64": "1.1.1",
+    "@ndhkaeru/codeloupe-mcp-darwin-x64": "1.1.1",
+    "@ndhkaeru/codeloupe-mcp-linux-arm64": "1.1.1",
+    "@ndhkaeru/codeloupe-mcp-linux-x64": "1.1.1",
+    "@ndhkaeru/codeloupe-mcp-win32-arm64": "1.1.1",
+    "@ndhkaeru/codeloupe-mcp-win32-x64": "1.1.1"
   },
   "scripts": {
     "prepare:native": "node scripts/prepare-npm-assets.js",
