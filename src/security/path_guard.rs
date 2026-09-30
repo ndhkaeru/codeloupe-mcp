@@ -141,13 +141,7 @@ impl PathGuard {
             );
         }
 
-        let warning = if display_str == canonical_str {
-            format!("low write risk: outside write roots: {display_str}")
-        } else {
-            format!(
-                "low write risk: outside write roots: requested {display_str}; canonical target {canonical_str}"
-            )
-        };
+        let warning = format!("low write risk: outside write roots: {canonical_str}");
         warned(canonical, Tier::LowRiskWarn, warning, true)
     }
 }
@@ -323,10 +317,33 @@ fn same_display_path(left: &Path, right: &Path) -> bool {
     {
         left.eq_ignore_ascii_case(&right)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        normalize_macos_system_alias(&left) == normalize_macos_system_alias(&right)
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         left == right
     }
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_system_alias(path: &str) -> String {
+    for (canonical, alias) in [
+        ("/private/var", "/var"),
+        ("/private/tmp", "/tmp"),
+        ("/private/etc", "/etc"),
+    ] {
+        if path == canonical {
+            return alias.to_string();
+        }
+        if let Some(suffix) = path.strip_prefix(canonical)
+            && suffix.starts_with('/')
+        {
+            return format!("{alias}{suffix}");
+        }
+    }
+    path.to_string()
 }
 
 fn path_resolves_through_link(path: &Path) -> bool {
@@ -378,6 +395,23 @@ mod tests {
         assert!(!same_display_path(
             Path::new("/tmp/Link"),
             Path::new("/tmp/link")
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn display_path_comparison_accepts_standard_macos_aliases() {
+        assert!(same_display_path(
+            Path::new("/var/folders/example/file.txt"),
+            Path::new("/private/var/folders/example/file.txt")
+        ));
+        assert!(same_display_path(
+            Path::new("/tmp/example/file.txt"),
+            Path::new("/private/tmp/example/file.txt")
+        ));
+        assert!(same_display_path(
+            Path::new("/etc/example.conf"),
+            Path::new("/private/etc/example.conf")
         ));
     }
 }
