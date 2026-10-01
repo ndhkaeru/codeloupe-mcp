@@ -73,6 +73,10 @@ jobs:
       - name: Run tests
         run: cargo test --release --locked
 
+      - name: Test npm upgrade while the launcher is running
+        if: runner.os == 'Windows'
+        run: node packages/npm/scripts/test-upgrade-while-running.js
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
@@ -119,7 +123,9 @@ jobs:
           node --check packages/npm/scripts/test-package-layout.js
           node --check packages/npm/scripts/test-launcher-resolution.js
           node --check packages/npm/scripts/test-packed-install.js
-          (cd packages/npm && npm run test:env && npm run test:layout)
+          node --check packages/npm/scripts/test-launcher-runtime.js
+          node --check packages/npm/scripts/test-upgrade-while-running.js
+          (cd packages/npm && npm run test:env && npm run test:layout && npm run test:runtime)
 
       - name: Validate MCP registry metadata
         run: |

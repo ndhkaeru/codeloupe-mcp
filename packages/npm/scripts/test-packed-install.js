@@ -78,6 +78,9 @@ try {
   delete environment.CODELOUPE_MCP_BINARY;
   delete environment.codeloupe_mcp_BINARY;
   delete environment.CODEBASE_MCP_BINARY;
+  delete environment.CODELOUPE_MCP_RUNTIME_COPY;
+  const runtimeRoot = path.join(temporaryRoot, 'runtime');
+  environment.CODELOUPE_MCP_RUNTIME_DIR = runtimeRoot;
   const installedLauncher = path.join(
     installRoot,
     'node_modules',
@@ -92,6 +95,13 @@ try {
   });
   assert.strictEqual(smoke.stdout.trim(), `codeloupe-mcp ${mainPackage.version}`);
   assert.strictEqual(smoke.stderr.trim(), '');
+  const runtimeCopies = fs.existsSync(runtimeRoot) ? fs.readdirSync(runtimeRoot) : [];
+  if (process.platform === 'win32') {
+    assert.strictEqual(runtimeCopies.length, 1, `expected one runtime copy, got ${runtimeCopies.join(', ') || 'none'}`);
+    assert.ok(runtimeCopies[0].startsWith(`${mainPackage.version}-`), runtimeCopies[0]);
+  } else {
+    assert.deepStrictEqual(runtimeCopies, []);
+  }
   console.log(`packed install smoke passed for ${platformKey}`);
 } finally {
   fs.rmSync(temporaryRoot, { recursive: true, force: true });

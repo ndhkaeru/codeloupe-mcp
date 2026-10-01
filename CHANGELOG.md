@@ -4,6 +4,13 @@ All notable changes to `codeloupe-mcp` are documented in this file.
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-01
+
+### Fixed
+
+- The Windows npm launcher now runs a versioned copy of the native binary from `%LOCALAPPDATA%\codeloupe-mcp\runtime`, so `npx -y @ndhkaeru/codeloupe-mcp@latest` upgrades no longer fail with `EBUSY` or leave npm temp directories behind while another MCP session is still running the server. Unused copies are pruned after a day; `CODELOUPE_MCP_RUNTIME_COPY=0` restores direct execution and `CODELOUPE_MCP_RUNTIME_DIR` relocates the copies.
+- Report index-budget rejections (`too_large` and `disk_budget`) before a metadata refresh becomes idle, so health checks cannot observe a stale `indexing` candidate after the scan fails. Regression tests now wait for both states to settle and include server diagnostics on timeout.
+
 ## [1.1.1] - 2026-09-30
 
 ### Security

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 use zip::write::SimpleFileOptions;
 
-const INDEX_SETTLE_MAX_POLLS: i64 = 40;
+const INDEX_SETTLE_MAX_POLLS: i64 = 280;
 
 fn server_binary() -> PathBuf {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_codeloupe-mcp").map(PathBuf::from)
@@ -492,6 +492,12 @@ fn call_binary_server_with_options_and_wait(
     let mut child = command.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stderr.read_to_string(&mut output).unwrap();
+        output
+    });
     writeln!(
         stdin,
         "{}",
@@ -525,9 +531,14 @@ fn call_binary_server_with_options_and_wait(
 
     drop(stdin);
     let status = child.wait().unwrap();
+    let stderr = stderr_reader.join().unwrap();
     assert!(
         status.success(),
-        "server exited unsuccessfully while polling health"
+        "server exited unsuccessfully while polling health: {stderr}"
+    );
+    assert!(
+        !health_indexing_in_progress(&result, wait_for_workspace),
+        "index did not settle; health: {result}; stderr: {stderr}"
     );
     result
 }
@@ -669,15 +680,28 @@ fn health_indexing_in_progress(health: &Value, wait_for_scheduled_index: bool) -
         .get("index_workspace_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let candidate_is_starting = workspace_count == 0
-        && health
-            .get("index_candidates")
-            .and_then(Value::as_array)
-            .is_some_and(|candidates| {
-                candidates.iter().any(|candidate| {
-                    candidate.get("status").and_then(Value::as_str) == Some("indexing")
-                })
-            });
+    let candidate_is_starting = health
+        .get("index_candidates")
+        .and_then(Value::as_array)
+        .is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate.get("status").and_then(Value::as_str) == Some("indexing")
+            })
+        })
+        && (workspace_count == 0
+            || health
+                .get("index_workspaces")
+                .and_then(Value::as_array)
+                .is_some_and(|workspaces| {
+                    workspaces.iter().any(|workspace| {
+                        matches!(
+                            workspace
+                                .pointer("/path_index/status")
+                                .and_then(Value::as_str),
+                            Some("idle" | "error")
+                        )
+                    })
+                }));
     let runtime_is_refreshing = health
         .get("index_workspaces")
         .and_then(Value::as_array)
@@ -688,6 +712,24 @@ fn health_indexing_in_progress(health: &Value, wait_for_scheduled_index: bool) -
         });
     let waiting_for_scheduled_index = wait_for_scheduled_index && workspace_count == 0;
     candidate_is_starting || runtime_is_refreshing || waiting_for_scheduled_index
+}
+
+#[test]
+fn test_health_waits_for_candidate_transition_during_index_start_and_failure() {
+    for status in ["idle", "error"] {
+        let health = json!({
+            "index_workspace_count": 1,
+            "index_candidates": [{"status": "indexing"}],
+            "index_workspaces": [{"path_index": {"status": status}, "refresh_running": false}]
+        });
+        assert!(health_indexing_in_progress(&health, false));
+    }
+    let settled = json!({
+        "index_workspace_count": 1,
+        "index_candidates": [{"status": "disk_budget"}],
+        "index_workspaces": [{"path_index": {"status": "error"}, "refresh_running": false}]
+    });
+    assert!(!health_indexing_in_progress(&settled, false));
 }
 
 fn call_binary_server_tools(

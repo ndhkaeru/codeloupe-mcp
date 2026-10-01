@@ -1373,7 +1373,6 @@ fn spawn_full_metadata_refresh(workspace_root: PathBuf, workspace_key: String) {
         match result {
             Ok(summary) => record_refresh_success(&workspace_key, summary),
             Err(err) => {
-                record_runtime_error(&workspace_key, err.clone());
                 if err.starts_with("too_large:") {
                     crate::workspace_control::record_rejected_candidate(
                         workspace_root.clone(),
@@ -1393,6 +1392,7 @@ fn spawn_full_metadata_refresh(workspace_root: PathBuf, workspace_key: String) {
                         None,
                     );
                 }
+                record_runtime_error(&workspace_key, err.clone());
                 error!(workspace = %workspace_root.display(), error = %err, "Metadata index refresh failed");
             }
         }
