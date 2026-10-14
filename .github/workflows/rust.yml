@@ -51,7 +51,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -81,11 +81,31 @@ jobs:
         run: node --test packages/npm/scripts/test-sync-version.js
 
       - name: Run tests
-        run: cargo test --release --locked
+        run: cargo test --workspace --release --locked
 
       - name: Test npm upgrade while the launcher is running
         if: runner.os == 'Windows'
         run: node packages/npm/scripts/test-upgrade-while-running.js
+
+  linux-file-workflows:
+    name: Linux filesystem failure paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache Linux test artifacts and Cargo downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/linux-file-workflows
+            target/linux-file-workflows-cargo
+          key: ${{ runner.os }}-linux-file-workflows-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'vendor/lru-compat/Cargo.toml', 'rust-toolchain.toml', 'scripts/test-linux-file-workflows.py') }}
+          restore-keys: |
+            ${{ runner.os }}-linux-file-workflows-
+
+      - name: Execute ignored tests with seccomp and negative controls
+        run: python3 scripts/test-linux-file-workflows.py
 
   audit:
     name: Security Audit
@@ -99,7 +119,7 @@ jobs:
           tool: cargo-audit
 
       - name: Run cargo audit
-        run: cargo audit
+        run: cargo audit -D warnings
 
   deny:
     name: Dependency Policy

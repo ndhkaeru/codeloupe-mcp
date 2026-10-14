@@ -692,6 +692,8 @@ At startup, index GC removes missing-workspace indexes after a 7-day grace perio
 
 Workspace roots are dynamic: explicit CLI/environment roots are approved first; client roots, a project-like process current directory, and workspace roots inferred from tool paths update the active context. Index loading runs in background so initialization and unrelated requests remain responsive; tools fall back to bounded filesystem access while a runtime is loading. Loaded runtimes use an in-memory LRU budget and can be reopened from their on-disk indexes after eviction. Recognized manifests include Rust, Node, Python, Go, Java/Gradle, Bazel, .NET (`*.sln`, `*.slnx`, `global.json`, `Directory.Build.props`), CMake, PHP Composer, Ruby, Elixir, and Scala/SBT projects. Tool paths without a recognized workspace marker still work through bounded filesystem access but never receive index advice. Explicit client roots remain valid active contexts even without markers; whether they index depends on `CODELOUPE_MCP_INDEX_MODE` or a persisted approval.
 
+Starting with 1.1.3, LMDB metadata uses JSON in separate versioned databases. Existing metadata is rebuilt on first use; legacy databases remain untouched so older servers can still read their metadata. Source files are unaffected. Tantivy 0.26.2 uses a small compatibility adapter to select the maintained LRU implementation until a released Tantivy accepts it directly; see [the adapter notes](https://github.com/ndhkaeru/codeloupe-mcp/blob/main/vendor/lru-compat/README.md).
+
 ### Shipping
 
 Releases are distributed through two channels:
@@ -702,7 +704,7 @@ Releases are distributed through two channels:
 Release checklist:
 
 1. Set `[package].version` in `Cargo.toml`, then run `npm --prefix packages/npm run version:sync`. This updates the root package in `Cargo.lock`, the npm launcher and its optional dependency pins, all six native package manifests, and both versions in `server.json`.
-2. Run the checks from `rust.yml`: format, clippy, tests, audit, deny, and typos.
+2. Run the checks from `rust.yml`: format, clippy, workspace tests, strict audit (`cargo audit -D warnings`), deny, typos, and the Linux filesystem failure-path harness.
 3. Push `main`, then check GitHub Actions for failures.
 4. Push a semver tag such as `v1.0.0`.
 5. Confirm release assets, all six platform npm packages, and the launcher npm package publish successfully.
@@ -713,10 +715,14 @@ Release checklist:
 ### Development
 
 ```bash
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --release
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --release --locked
+cargo audit -D warnings
+cargo deny check advisories bans licenses sources
 ```
+
+The three Linux tests requiring cross-device moves or denied syscalls remain `ignored` in the ordinary suite. Run `python3 scripts/test-linux-file-workflows.py` with Docker to execute each explicitly. The harness checks that syscall-denial tests fail without seccomp, then runs the cross-device, chmod-denied, exclusive-create, and combined profiles. CI runs this harness in a dedicated Linux job and fails if any expected test is missing or does not execute.
 
 ### License
 

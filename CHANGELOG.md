@@ -14,6 +14,7 @@ All notable changes to `codeloupe-mcp` are documented in this file.
 
 ### Changed
 
+- CI explicitly executes the three Linux integration tests requiring cross-device storage or seccomp syscall failures, including combined permission/fallback cases and negative controls. Audit warnings now fail CI.
 - Release metadata now uses `Cargo.toml` as its version source. `npm --prefix packages/npm run version:sync` synchronizes Rust, npm, native packages, and MCP metadata; CI checks drift without modifying files.
 - Added `dry_run` previews and `change_set_id` for multi-file edits. Grouped undo checks every tracked path before restoring any path, removes tracked directory children first, and rejects directories containing entries outside the group. History remains bounded and process-local.
 - Undoing one entry from a multi-entry group now requires `allow_partial=true`; use `change_set_id` to undo the complete group.
@@ -21,6 +22,7 @@ All notable changes to `codeloupe-mcp` are documented in this file.
 
 ### Fixed
 
+- Removed unmaintained `bincode` from the metadata cache, updated `memmap2` to 0.9.11, and selected the maintained LRU 0.18.5 implementation through a compatibility adapter for Tantivy 0.26.2. LMDB metadata rebuilds as JSON in separate versioned databases while preserving legacy records for older servers.
 - Prevented new-file publication from overwriting a destination created by another process after preflight. Native no-replace rename and hard links fall back to exclusive creation on Unix filesystems that do not support them; non-atomic new-file publication is reported.
 - Create Unix replacement and transfer files with the desired permission mode before writing bytes, so a denied chmod retains that mode or a narrower mode rather than broader default permissions. Permission restoration remains best-effort and reports `permissions_preserved=false` when it fails.
 - Preserve the source syntax baseline through copy/move operations, allowing unchanged JSONC and files with preexisting parse errors. Fixed Unicode case-only file renames on case-insensitive filesystems and structured transfer error reporting.

@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use fs2::{available_space, total_space};
-use heed::types::{SerdeBincode, SerdeJson, Str};
+use heed::types::{SerdeJson, Str};
 use heed::{Database, Env, EnvOpenOptions};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{WalkBuilder, WalkState};
@@ -42,7 +42,7 @@ lazy_static::lazy_static! {
     static ref ACTIVE_WORKSPACE_KEY: RwLock<Option<String>> = RwLock::new(None);
 }
 
-const INDEX_SCHEMA_VERSION: u32 = 2;
+const INDEX_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_STALE_INDEX_SECS: u64 = 60 * 60;
 const MIN_REFRESH_INTERVAL_SECS: u64 = 30;
 const MIN_INDEX_TERM_LEN: usize = 3;
@@ -68,9 +68,9 @@ const DEFAULT_INDEX_MAX_LOADED_WORKSPACES: usize = 16;
 const ROOT_CHILDREN_KEY: &str = ".";
 static RUNTIME_ACCESS_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-type MetaDb = Database<Str, SerdeBincode<WorkspaceMeta>>;
-type PathDb = Database<Str, SerdeBincode<IndexedPathEntry>>;
-type ChildrenDb = Database<Str, SerdeBincode<Vec<String>>>;
+type MetaDb = Database<Str, SerdeJson<WorkspaceMeta>>;
+type PathDb = Database<Str, SerdeJson<IndexedPathEntry>>;
+type ChildrenDb = Database<Str, SerdeJson<Vec<String>>>;
 
 #[derive(Debug, Clone)]
 struct IndexRuntime {
@@ -1284,7 +1284,7 @@ fn load_existing_index(
     let meta = match store.meta_db.get(&rtxn, "workspace") {
         Ok(Some(meta)) => meta,
         Ok(None) => return Ok(None),
-        Err(_) => return load_existing_json_index(&store, &rtxn, workspace_root),
+        Err(error) => return Err(format!("meta_read_failed: {error}")),
     };
 
     if meta.schema_version != INDEX_SCHEMA_VERSION {
@@ -1305,7 +1305,7 @@ fn load_existing_index(
     for item in path_iter {
         match item {
             Ok((_, entry)) => entries.push(entry),
-            Err(_) => return load_existing_json_index(&store, &rtxn, workspace_root),
+            Err(error) => return Err(format!("path_decode_failed: {error}")),
         }
     }
 
@@ -1316,47 +1316,6 @@ fn load_existing_index(
         "Loaded LMDB metadata index"
     );
     Ok(Some((meta, index)))
-}
-
-fn load_existing_json_index(
-    store: &IndexStore,
-    rtxn: &heed::RoTxn<'_>,
-    workspace_root: &Path,
-) -> Result<Option<(WorkspaceMeta, PathIndex)>, String> {
-    let meta_db = store.meta_db.remap_data_type::<SerdeJson<WorkspaceMeta>>();
-    let path_db = store
-        .path_db
-        .remap_data_type::<SerdeJson<IndexedPathEntry>>();
-    let Some(meta) = meta_db
-        .get(rtxn, "workspace")
-        .map_err(|e| format!("meta_json_read_failed: {e}"))?
-    else {
-        return Ok(None);
-    };
-
-    if meta.schema_version != INDEX_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported_schema_version: got={}, expected={}",
-            meta.schema_version, INDEX_SCHEMA_VERSION
-        ));
-    }
-    if meta.workspace_root != normalize_path_for_identity(workspace_root) {
-        return Err("workspace_mismatch".to_string());
-    }
-
-    let mut entries = Vec::new();
-    for item in path_db
-        .iter(rtxn)
-        .map_err(|e| format!("path_json_iter_failed: {e}"))?
-    {
-        let (_, entry) = item.map_err(|e| format!("path_json_decode_failed: {e}"))?;
-        entries.push(entry);
-    }
-
-    Ok(Some((
-        meta,
-        PathIndex::from_entries(workspace_root, entries),
-    )))
 }
 
 fn spawn_full_metadata_refresh(workspace_root: PathBuf, workspace_key: String) {
@@ -1748,13 +1707,13 @@ fn open_store(workspace_root: &Path) -> Result<Arc<IndexStore>, String> {
         .write_txn()
         .map_err(|e| format!("write_txn_failed: {e}"))?;
     let meta_db: MetaDb = env
-        .create_database(&mut wtxn, Some("workspace_meta"))
+        .create_database(&mut wtxn, Some("workspace_meta_v3"))
         .map_err(|e| format!("meta_db_open_failed: {e}"))?;
     let path_db: PathDb = env
-        .create_database(&mut wtxn, Some("path_by_rel"))
+        .create_database(&mut wtxn, Some("path_by_rel_v3"))
         .map_err(|e| format!("path_db_open_failed: {e}"))?;
     let children_db: ChildrenDb = env
-        .create_database(&mut wtxn, Some("children_by_parent"))
+        .create_database(&mut wtxn, Some("children_by_parent_v3"))
         .map_err(|e| format!("children_db_open_failed: {e}"))?;
     wtxn.commit()
         .map_err(|e| format!("db_open_commit_failed: {e}"))?;
@@ -3915,6 +3874,76 @@ mod tests {
 
         assert!(!legacy_dir.exists());
         assert_eq!(fs::read(stable_dir.join("payload.bin")).unwrap(), b"legacy");
+    }
+
+    #[test]
+    fn json_metadata_rebuild_preserves_legacy_databases() {
+        use heed::types::Bytes;
+
+        for legacy_payload in [
+            b"opaque legacy binary record".to_vec(),
+            serde_json::to_vec(&WorkspaceMeta {
+                schema_version: 2,
+                ..WorkspaceMeta::default()
+            })
+            .unwrap(),
+        ] {
+            let workspace = tempdir().unwrap();
+            let root = workspace.path();
+            fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+            let key = normalize_path_for_identity(root);
+            let store = open_store(root).unwrap();
+            let mut wtxn = store.env.write_txn().unwrap();
+            let old_meta: Database<Str, Bytes> = store
+                .env
+                .create_database(&mut wtxn, Some("workspace_meta"))
+                .unwrap();
+            let old_paths: Database<Str, Bytes> = store
+                .env
+                .create_database(&mut wtxn, Some("path_by_rel"))
+                .unwrap();
+            let old_children: Database<Str, Bytes> = store
+                .env
+                .create_database(&mut wtxn, Some("children_by_parent"))
+                .unwrap();
+            old_meta
+                .put(&mut wtxn, "workspace", &legacy_payload)
+                .unwrap();
+            old_paths
+                .put(&mut wtxn, "legacy.rs", b"legacy path")
+                .unwrap();
+            old_children
+                .put(&mut wtxn, ".", b"legacy children")
+                .unwrap();
+            wtxn.commit().unwrap();
+
+            assert!(load_existing_index(&key, root).unwrap().is_none());
+            assert_eq!(refresh_metadata_index(root, &key).unwrap().files, 1);
+            let (meta, index) = load_existing_index(&key, root).unwrap().unwrap();
+            assert_eq!(meta.schema_version, 3);
+            assert_eq!(index.live_entries, 1);
+            let rtxn = store.env.read_txn().unwrap();
+            assert_eq!(
+                old_meta.get(&rtxn, "workspace").unwrap(),
+                Some(legacy_payload.as_slice())
+            );
+            assert_eq!(
+                old_paths.get(&rtxn, "legacy.rs").unwrap(),
+                Some(&b"legacy path"[..])
+            );
+            assert_eq!(
+                old_children.get(&rtxn, ".").unwrap(),
+                Some(&b"legacy children"[..])
+            );
+            let raw_meta = store.meta_db.remap_data_type::<Bytes>();
+            let raw = raw_meta.get(&rtxn, "workspace").unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<WorkspaceMeta>(raw)
+                    .unwrap()
+                    .schema_version,
+                3
+            );
+        }
     }
 
     #[test]

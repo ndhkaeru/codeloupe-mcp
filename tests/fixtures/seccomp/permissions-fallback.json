@@ -1,0 +1,18 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "names": [
+        "renameat2",
+        "link",
+        "linkat",
+        "chmod",
+        "fchmod",
+        "fchmodat",
+        "fchmodat2"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}

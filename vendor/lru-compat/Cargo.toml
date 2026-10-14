@@ -1,0 +1,13 @@
+[package]
+name = "lru"
+version = "0.16.5"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Compatibility re-export of patched lru for Tantivy 0.26"
+
+[dependencies]
+lru-fixed = { package = "lru", version = "=0.18.5" }
+
+[package.metadata.dist]
+dist = false
