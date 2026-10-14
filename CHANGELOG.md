@@ -4,6 +4,27 @@ All notable changes to `codeloupe-mcp` are documented in this file.
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-10-14
+
+### Added
+
+- Added `copy_file` and `move_file` for regular files, with no-overwrite defaults, hash preconditions, dry-run previews, and undo history. `move_file` can return bounded lexical reference hints within an explicit search scope, including in dry-run.
+- Added `diff_files` to compare text files, supplied content, or the before/after snapshots of a history entry, with bounded output and explicit truncation.
+- Extended `edit_files` with ordered `edit`, `create`, `delete`, `copy`, `move`, `transfer`, and `mkdir` operations. Virtual preflight supports creating a directory, moving a file into it, and editing that file in one change set.
+
+### Changed
+
+- Release metadata now uses `Cargo.toml` as its version source. `npm --prefix packages/npm run version:sync` synchronizes Rust, npm, native packages, and MCP metadata; CI checks drift without modifying files.
+- Added `dry_run` previews and `change_set_id` for multi-file edits. Grouped undo checks every tracked path before restoring any path, removes tracked directory children first, and rejects directories containing entries outside the group. History remains bounded and process-local.
+- Undoing one entry from a multi-entry group now requires `allow_partial=true`; use `change_set_id` to undo the complete group.
+- Added `expected_hash` for `create_file overwrite=true` and documented a preview/apply/grouped-undo workflow for lexical symbol renames. Reconnect MCP clients after upgrading to load the new tools and extended schemas.
+
+### Fixed
+
+- Prevented new-file publication from overwriting a destination created by another process after preflight. Native no-replace rename and hard links fall back to exclusive creation on Unix filesystems that do not support them; non-atomic new-file publication is reported.
+- Create Unix replacement and transfer files with the desired permission mode before writing bytes, so a denied chmod retains that mode or a narrower mode rather than broader default permissions. Permission restoration remains best-effort and reports `permissions_preserved=false` when it fails.
+- Preserve the source syntax baseline through copy/move operations, allowing unchanged JSONC and files with preexisting parse errors. Fixed Unicode case-only file renames on case-insensitive filesystems and structured transfer error reporting.
+
 ## [1.1.2] - 2026-10-01
 
 ### Fixed

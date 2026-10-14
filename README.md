@@ -701,12 +701,14 @@ Releases are distributed through two channels:
 
 Release checklist:
 
-1. Update versions in `Cargo.toml`, `Cargo.lock`, `packages/npm/package.json`, every `packages/npm-platforms/*/package.json`, and `server.json`.
+1. Set `[package].version` in `Cargo.toml`, then run `npm --prefix packages/npm run version:sync`. This updates the root package in `Cargo.lock`, the npm launcher and its optional dependency pins, all six native package manifests, and both versions in `server.json`.
 2. Run the checks from `rust.yml`: format, clippy, tests, audit, deny, and typos.
 3. Push `main`, then check GitHub Actions for failures.
 4. Push a semver tag such as `v1.0.0`.
 5. Confirm release assets, all six platform npm packages, and the launcher npm package publish successfully.
 6. Smoke test `npx -y @ndhkaeru/codeloupe-mcp@<version>`.
+
+`Cargo.toml` is the version source. The sync command preserves existing formatting and preflights all metadata before writing; failed writes roll back completed changes unless a file was independently edited. `npm --prefix packages/npm run version:check` checks synchronization and MCP identity without writing. CI runs this check and exercises synchronization on Linux, Windows, and macOS. Changelog dates and release notes remain editorial updates.
 
 ### Development
 

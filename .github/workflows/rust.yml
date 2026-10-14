@@ -70,6 +70,16 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Check synchronized release versions
+        run: node packages/npm/scripts/sync-version.js --check
+
+      - name: Test version synchronization
+        run: node --test packages/npm/scripts/test-sync-version.js
+
       - name: Run tests
         run: cargo test --release --locked
 
@@ -119,6 +129,8 @@ jobs:
         run: |
           node --check packages/npm/bin/codeloupe-mcp.js
           node --check packages/npm/scripts/prepare-npm-assets.js
+          node --check packages/npm/scripts/sync-version.js
+          node --check packages/npm/scripts/test-sync-version.js
           node --check packages/npm/scripts/smoke.js
           node --check packages/npm/scripts/test-package-layout.js
           node --check packages/npm/scripts/test-launcher-resolution.js
@@ -127,25 +139,8 @@ jobs:
           node --check packages/npm/scripts/test-upgrade-while-running.js
           (cd packages/npm && npm run test:env && npm run test:layout && npm run test:runtime)
 
-      - name: Validate MCP registry metadata
-        run: |
-          node - <<'NODE'
-          const pkg = require('./packages/npm/package.json');
-          const server = require('./server.json');
-          const mismatches = [];
-          if (server.name !== pkg.mcpName) mismatches.push(`server.name=${server.name} != package.mcpName=${pkg.mcpName}`);
-          if (server.version !== pkg.version) mismatches.push(`server.version=${server.version} != package.version=${pkg.version}`);
-          for (const packageEntry of server.packages || []) {
-            if (packageEntry.identifier === pkg.name && packageEntry.version !== pkg.version) {
-              mismatches.push(`server package ${packageEntry.identifier} version=${packageEntry.version} != package.version=${pkg.version}`);
-            }
-          }
-          if (mismatches.length) {
-            console.error('server.json is out of sync with packages/npm/package.json:');
-            for (const mismatch of mismatches) console.error(`  ${mismatch}`);
-            process.exit(1);
-          }
-          NODE
+      - name: Check synchronized release versions and MCP identity
+        run: npm --prefix packages/npm run version:check
 
       - name: Check npm package shape
         working-directory: packages/npm
