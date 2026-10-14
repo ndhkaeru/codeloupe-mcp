@@ -1,10 +1,10 @@
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::history::{
-    PathSnapshot, SnapshotState, capture_snapshot, file_snapshot, no_history, record_change,
+    PathSnapshot, SnapshotState, capture_snapshot, file_snapshot, no_history, record_change_set,
     snapshots_match_contents,
 };
 use crate::limits::MAX_IN_MEMORY_TEXT_FILE_BYTES;
@@ -25,26 +25,26 @@ enum LineEndings {
     Mixed,
 }
 
-struct PreparedFile {
-    path: PathBuf,
-    canonical_path: PathBuf,
-    before: PathSnapshot,
-    after: PathSnapshot,
-    previous_encoding: String,
-    target_encoding: String,
-    encoding_changed: bool,
-    replacements: usize,
-    changed: bool,
-    validation: &'static str,
-    sha256_before: String,
-    sha256_after: String,
+pub(crate) struct PreparedFile {
+    pub(crate) path: PathBuf,
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) before: PathSnapshot,
+    pub(crate) after: PathSnapshot,
+    pub(crate) previous_encoding: String,
+    pub(crate) target_encoding: String,
+    pub(crate) encoding_changed: bool,
+    pub(crate) replacements: usize,
+    pub(crate) changed: bool,
+    pub(crate) validation: &'static str,
+    pub(crate) sha256_before: String,
+    pub(crate) sha256_after: String,
 }
 
 pub fn schema() -> Value {
     json!({
         "name": "edit_files",
         "title": "Edit multiple files",
-        "description": "Apply exact find-replace edits to up to 20 existing text files. Preflights every path, replacement count, and supported syntax before writing; writes each file atomically and rolls back earlier files if a later write fails. This is rollback-backed, not a filesystem-wide atomic transaction.",
+        "description": "Apply files exact edits or ordered operations (edit/create/delete/copy/move/transfer/mkdir). Up to 20 paths, 100 steps, bounded text snapshots. Virtual preflight, rollback and grouped process-local undo. Existing replacements are atomic; new files may use exclusive creation, reported by publication_atomic=false. dry_run returns bounded diffs without writes. Not filesystem-wide atomic.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -75,14 +75,25 @@ pub fn schema() -> Value {
                         "required": ["path", "edits"]
                     }
                 },
+                "operations": super::file_operations::operations_schema(),
+                "dry_run": { "type": "boolean" },
                 "validate_syntax": { "type": "boolean", "description": "Reject newly introduced JSON or Tree-sitter parse errors before writing. Defaults to true." }
             },
-            "required": ["files"]
+            "oneOf": [{"required":["files"]},{"required":["operations"]}]
         }
     })
 }
 
 pub async fn execute(args: &Value) -> Result<Value> {
+    if args.get("operations").is_some() {
+        if args.get("files").is_some() {
+            return Ok(error_response(
+                "ambiguous_operations",
+                "use files or operations, not both",
+            ));
+        }
+        return super::file_operations::execute(args);
+    }
     let files = match args.get("files").and_then(Value::as_array) {
         Some(files) if !files.is_empty() => files,
         _ => {
@@ -119,27 +130,62 @@ pub async fn execute(args: &Value) -> Result<Value> {
         }
     }
 
-    let mut writer = super::atomic_write::write_bytes;
+    if args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let files: Vec<Value> = prepared.iter().map(|file| {
+            let before = decode_fuzzy(file.before.bytes.as_deref().unwrap_or_default()).0;
+            let after = decode_fuzzy(file.after.bytes.as_deref().unwrap_or_default()).0;
+            json!({"path":crate::common::normalize_display_path(&file.path), "changed":file.changed,
+                "sha256_before":file.sha256_before,"sha256_after":file.sha256_after,
+                "diff": super::diff_files::bounded_diff(&before, &after, "before", "after", 2048)})
+        }).collect();
+        return Ok(
+            json!({"success":true,"dry_run":true,"files":files,"files_changed":prepared.iter().filter(|f| f.changed).count(),"history_recorded":false}),
+        );
+    }
+
+    let changes = prepared
+        .iter()
+        .filter(|f| f.changed)
+        .map(|f| {
+            (
+                f.path.clone(),
+                f.before.clone(),
+                f.after.clone(),
+                format!("apply {} exact edits", f.replacements),
+            )
+        })
+        .collect();
+
+    let mut publications = BTreeMap::new();
+    let mut writer = |path: &Path, bytes: &[u8], replace_existing: bool| {
+        let publication =
+            super::atomic_write::write_bytes_with_status(path, bytes, replace_existing)?;
+        publications.insert(path.to_path_buf(), publication);
+        Ok(())
+    };
     if let Err(error) = commit_prepared_with_writer(&prepared, &mut writer) {
         return Ok(error);
     }
 
+    let outcomes = record_change_set("edit_files", changes);
+    let change_set_id = outcomes.first().and_then(|o| o.change_set_id.clone());
+    let mut outcomes = outcomes.into_iter();
     let mut file_results = Vec::with_capacity(prepared.len());
     let mut files_changed = 0usize;
     for file in prepared {
         let history = if file.changed {
             files_changed += 1;
-            record_change(
-                "edit_files",
-                &file.path,
-                file.before,
-                file.after,
-                format!("apply {} exact edits", file.replacements),
-            )
+            outcomes
+                .next()
+                .unwrap_or_else(|| no_history("history unavailable"))
         } else {
             no_history("no filesystem change")
         };
-        file_results.push(json!({
+        let mut result = json!({
             "path": crate::common::normalize_display_path(&file.path),
             "canonical_path": crate::common::normalize_display_path(&file.canonical_path),
             "changed": file.changed,
@@ -153,12 +199,17 @@ pub async fn execute(args: &Value) -> Result<Value> {
             "history_recorded": history.recorded,
             "history_entry_id": history.entry_id,
             "history_reason": history.reason
-        }));
+        });
+        if let Some(publication) = publications.get(&file.path) {
+            publication.attach(&mut result);
+        }
+        file_results.push(result);
     }
 
     Ok(json!({
         "success": true,
         "files": file_results,
+        "change_set_id": change_set_id,
         "files_total": file_results.len(),
         "files_changed": files_changed,
         "edits_total": total_edits,
@@ -267,6 +318,26 @@ fn prepare_file(
     }
     let before = capture_snapshot(&path)
         .map_err(|message| file_error("snapshot_failed", message, file_index))?;
+    prepare_snapshot(
+        file,
+        file_index,
+        validate_syntax,
+        total_edits,
+        path,
+        canonical_path,
+        before,
+    )
+}
+
+pub(crate) fn prepare_snapshot(
+    file: &Value,
+    file_index: usize,
+    validate_syntax: bool,
+    total_edits: &mut usize,
+    path: PathBuf,
+    canonical_path: PathBuf,
+    before: PathSnapshot,
+) -> std::result::Result<PreparedFile, Value> {
     let before_bytes = match (&before.state, before.bytes.as_deref()) {
         (SnapshotState::File, Some(bytes)) => bytes,
         _ => {
@@ -445,7 +516,7 @@ fn prepare_file(
     })
 }
 
-fn validate_new_syntax(
+pub(crate) fn validate_new_syntax(
     path: &Path,
     before: &str,
     after: &str,
@@ -496,6 +567,16 @@ where
                 crate::common::normalize_display_path(&file.path)
             ));
             continue;
+        }
+        match capture_snapshot(&file.path) {
+            Ok(current) if snapshots_match_contents(&current, &file.after) => {}
+            _ => {
+                errors.push(format!(
+                    "{}: changed since commit; refusing rollback",
+                    crate::common::normalize_display_path(&file.path)
+                ));
+                continue;
+            }
         }
         let bytes = file.before.bytes.as_deref().unwrap_or_default();
         if let Err(error) = writer(&file.path, bytes, true) {

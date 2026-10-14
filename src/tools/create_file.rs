@@ -38,6 +38,7 @@ pub fn schema() -> Value {
                 "path": { "type": "string" },
                 "content": { "type": "string" },
                 "overwrite": { "type": "boolean" },
+                "expected_hash": { "type": "string" },
                 "create_parents": { "type": "boolean" },
                 "target_encoding": { "type": "string", "enum": ["UTF-8", "Windows-1252"] },
                 "target_line_ending": { "type": "string", "enum": ["lf", "crlf"] }
@@ -227,6 +228,46 @@ pub async fn execute(args: &Value) -> Result<Value> {
         }
     }
 
+    let expected = match args.get("expected_hash").and_then(Value::as_str) {
+        Some(raw) => match super::file_hash::normalize_expected_hash(raw) {
+            Ok(hash) => Some(hash),
+            Err(message) => {
+                return Ok(error_response(
+                    &path,
+                    &canonical_from_guard,
+                    "invalid_hash",
+                    message,
+                ));
+            }
+        },
+        None => None,
+    };
+    if let Some(expected) = &expected {
+        if !overwrite {
+            return Ok(error_response(
+                &path,
+                &canonical_from_guard,
+                "invalid_precondition",
+                "expected_hash requires overwrite=true",
+            ));
+        }
+        let actual = super::file_hash::sha256_file(&path).ok();
+        let snapshot_matches = before_snapshot
+            .as_ref()
+            .ok()
+            .and_then(crate::history::snapshot_hash)
+            .as_ref()
+            == Some(expected);
+        if actual.as_ref() != Some(expected) || (before_snapshot.is_ok() && !snapshot_matches) {
+            return Ok(error_response(
+                &path,
+                &canonical_from_guard,
+                "hash_mismatch",
+                "target does not match expected_hash",
+            ));
+        }
+    }
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
@@ -259,14 +300,44 @@ pub async fn execute(args: &Value) -> Result<Value> {
         ));
     }
 
-    if let Err(err) = crate::tools::atomic_write::write_bytes(&path, &final_bytes, existed_before) {
-        return Ok(io_error_response(
+    if let Some(expected) = &expected
+        && super::file_hash::sha256_file(&path).ok().as_ref() != Some(expected)
+    {
+        return Ok(error_response(
             &path,
             &canonical_from_guard,
-            "write file atomically",
-            &err,
+            "hash_mismatch",
+            "target changed before write",
         ));
     }
+    if GUARD.check_path(&path) != canonical_from_guard {
+        return Ok(error_response(
+            &path,
+            &canonical_from_guard,
+            "path_changed",
+            "target resolves to a different location",
+        ));
+    }
+
+    let publication = match crate::tools::atomic_write::write_bytes_with_status(
+        &path,
+        &final_bytes,
+        existed_before,
+    ) {
+        Ok(publication) => publication,
+        Err(err) => {
+            return Ok(io_error_response(
+                &path,
+                &canonical_from_guard,
+                if existed_before {
+                    "replace existing file"
+                } else {
+                    "publish new file without replacing an unexpected destination"
+                },
+                &err,
+            ));
+        }
+    };
 
     let canonical_written = std::fs::canonicalize(&path).unwrap_or(canonical_from_guard);
     let sha256_after = super::file_hash::sha256_bytes(&final_bytes);
@@ -301,6 +372,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
         "sha256_after": sha256_after,
         "message": if existed_before { "file overwritten" } else { "file created" }
     });
+    publication.attach(&mut response);
     attach_history_metadata(&mut response, &history_outcome);
     Ok(response)
 }

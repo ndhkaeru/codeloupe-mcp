@@ -18,14 +18,19 @@ pub mod compare_directories;
 pub mod compare_symbols;
 pub mod content_index_status;
 pub mod convert_file_format;
+pub mod copy_file;
 pub mod count_file_lines;
 pub mod create_directory;
 pub mod create_file;
 pub mod delete_file;
+pub mod diff_files;
 pub mod edit_file;
 pub mod edit_files;
 pub mod file_hash;
+mod file_operations;
 pub mod file_summary;
+mod file_transaction;
+mod file_transfer;
 pub mod find_definition;
 pub mod find_references;
 pub mod fuzzy_find;
@@ -35,6 +40,8 @@ pub mod index_gc;
 pub mod list_exports;
 pub mod list_history;
 pub mod list_imports;
+pub mod move_file;
+mod move_reference_hints;
 pub mod peek_archive;
 pub mod project_map;
 pub mod read_file;
@@ -44,6 +51,7 @@ pub mod resolve_path;
 pub mod search_workspace;
 pub mod server_health;
 pub mod text_search;
+mod tool_errors;
 pub mod undo_change;
 pub mod validate_json;
 pub mod warm_content_index;
@@ -66,6 +74,9 @@ fn full_tool_schemas() -> Vec<Value> {
         count_file_lines::schema(),
         convert_file_format::schema(),
         create_file::schema(),
+        copy_file::schema(),
+        move_file::schema(),
+        diff_files::schema(),
         create_directory::schema(),
         delete_file::schema(),
         edit_file::schema(),
@@ -188,6 +199,8 @@ struct WritePreflight {
 fn preflight_write_targets(tool_name: &str, arguments: &Value) -> WritePreflight {
     let mut raw_targets = Vec::new();
     collect_write_targets(tool_name, arguments, &mut raw_targets);
+    let preview = arguments.get("dry_run").and_then(Value::as_bool) == Some(true)
+        && matches!(tool_name, "edit_files" | "copy_file" | "move_file");
     let mut warnings = BTreeMap::<String, String>::new();
     let mut unacknowledged_critical = Vec::new();
     let mut critical_paths = Vec::new();
@@ -199,7 +212,7 @@ fn preflight_write_targets(tool_name: &str, arguments: &Value) -> WritePreflight
         }
         if classification.tier == crate::security::path_guard::Tier::CriticalRiskWarn {
             critical_paths.push(classification.canonical.clone());
-            if !target.acknowledged {
+            if !target.acknowledged && !preview {
                 unacknowledged_critical.push((target.path, classification.canonical));
             }
         }
@@ -238,13 +251,29 @@ fn collect_write_targets(tool_name: &str, arguments: &Value, targets: &mut Vec<W
     let acknowledged = arguments
         .get("acknowledge_risk")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || (arguments.get("dry_run").and_then(Value::as_bool) == Some(true)
+            && matches!(tool_name, "edit_files" | "copy_file" | "move_file"));
     match tool_name {
+        "copy_file" | "move_file" => {
+            push_write_path(arguments, "source", acknowledged, targets);
+            push_write_path(arguments, "destination", acknowledged, targets);
+        }
         "create_directory" => push_write_path(arguments, "path", acknowledged, targets),
         "create_file" | "delete_file" | "edit_file" | "convert_file_format" => {
             push_write_path(arguments, "path", acknowledged, targets)
         }
         "edit_files" => {
+            for op in arguments
+                .get("operations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                for field in ["path", "source", "destination"] {
+                    push_write_path(op, field, acknowledged, targets);
+                }
+            }
             for file in arguments
                 .get("files")
                 .and_then(Value::as_array)
@@ -255,15 +284,28 @@ fn collect_write_targets(tool_name: &str, arguments: &Value, targets: &mut Vec<W
             }
         }
         "undo_change" => {
-            if let Some(record) = arguments
-                .get("entry_id")
-                .and_then(Value::as_str)
-                .and_then(crate::history::get_record)
-            {
+            let records =
+                if let Some(group) = arguments.get("change_set_id").and_then(Value::as_str) {
+                    crate::history::get_change_set(group.trim())
+                } else {
+                    arguments
+                        .get("entry_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| crate::history::get_record(id.trim()))
+                        .into_iter()
+                        .collect()
+                };
+            for record in records {
                 targets.push(WriteTarget {
                     path: PathBuf::from(record.path),
                     acknowledged,
                 });
+                if let Some(link) = record.move_link {
+                    targets.push(WriteTarget {
+                        path: PathBuf::from(link.destination),
+                        acknowledged,
+                    });
+                }
             }
         }
         "batch_tool_call" => {
@@ -308,6 +350,8 @@ fn is_write_tool(tool_name: &str) -> bool {
             | "convert_file_format"
             | "undo_change"
             | "edit_files"
+            | "copy_file"
+            | "move_file"
     )
 }
 
@@ -385,6 +429,9 @@ pub(crate) async fn call_tool_inner_with_cancellation(
         "count_file_lines" => count_file_lines::execute(&arguments).await,
         "convert_file_format" => convert_file_format::execute(&arguments).await,
         "create_file" => create_file::execute(&arguments).await,
+        "copy_file" => copy_file::execute(&arguments).await,
+        "move_file" => move_file::execute(&arguments).await,
+        "diff_files" => diff_files::execute(&arguments).await,
         "create_directory" => create_directory::execute(&arguments).await,
         "delete_file" => delete_file::execute(&arguments).await,
         "edit_file" => edit_file::execute(&arguments).await,
@@ -1036,6 +1083,11 @@ fn compact_success_response(tool_name: &str, value: &mut Value) {
     let Some(source) = value.as_object() else {
         return;
     };
+    if source.get("dry_run").and_then(Value::as_bool) == Some(true)
+        || (tool_name == "undo_change" && source.contains_key("files"))
+    {
+        return;
+    }
     let compact = match tool_name {
         "edit_file" => compact_edit_file_success(source),
         "create_file" => compact_create_file_success(source),
@@ -1046,6 +1098,12 @@ fn compact_success_response(tool_name: &str, value: &mut Value) {
         "edit_files" => compact_edit_files_success(source),
         _ => return,
     };
+    let mut compact = compact;
+    for field in ["publication_atomic", "permissions_preserved"] {
+        if source.get(field).and_then(Value::as_bool) == Some(false) {
+            compact.insert(field.into(), Value::Bool(false));
+        }
+    }
     *value = Value::Object(compact);
 }
 
@@ -1059,6 +1117,8 @@ fn compact_write_error_response(tool_name: &str, value: &mut Value) {
             | "convert_file_format"
             | "undo_change"
             | "edit_files"
+            | "copy_file"
+            | "move_file"
     ) || !value.get("error").is_some_and(Value::is_object)
     {
         return;
@@ -1194,6 +1254,11 @@ fn compact_undo_change_success(
         &[
             "path",
             "undone_entry_id",
+            "undone_change_set_id",
+            "change_set_id",
+            "partial_undo",
+            "partial_change_set_id",
+            "warnings",
             "restored_state",
             "sha256_after",
             "history_entry_id",
@@ -1207,7 +1272,11 @@ fn compact_edit_files_success(
     source: &serde_json::Map<String, Value>,
 ) -> serde_json::Map<String, Value> {
     let mut compact = serde_json::Map::new();
-    copy_response_fields(source, &mut compact, &["root", "files_changed"]);
+    copy_response_fields(
+        source,
+        &mut compact,
+        &["root", "files_changed", "change_set_id"],
+    );
     let files = source
         .get("files")
         .and_then(Value::as_array)
@@ -1220,7 +1289,16 @@ fn compact_edit_files_success(
                     copy_response_fields(
                         file,
                         &mut compact_file,
-                        &["path", "replacements", "sha256_after", "history_entry_id"],
+                        &[
+                            "path",
+                            "replacements",
+                            "sha256_after",
+                            "history_entry_id",
+                            "before_state",
+                            "after_state",
+                            "publication_atomic",
+                            "permissions_preserved",
+                        ],
                     );
                     if file.get("changed").and_then(Value::as_bool) == Some(false) {
                         compact_file.insert("changed".to_string(), Value::Bool(false));

@@ -483,29 +483,75 @@ The server negotiates supported MCP protocol versions (`2024-11-05`, `2025-03-26
 | `file_hash` | Compute a file's SHA-256 digest with streaming I/O. |
 | `validate_json` | Validate JSON syntax from a UTF-8 file or inline content. |
 | `convert_file_format` | Rewrite a file with normalized encoding and line endings. |
-| `create_file` | Create or overwrite a file. |
+| `create_file` | Create or overwrite a file, with an optional overwrite hash precondition. |
+| `copy_file` | Stream and verify a byte-for-byte file copy without overwriting. |
+| `move_file` | Move or rename one file, including verified cross-device moves and inverse-move undo. |
+| `diff_files` | Compare text paths, inline content, or retained before/after history snapshots. |
 | `create_directory` | Create a directory with optional parent creation. |
 | `edit_file` | Edit a file with replace, append, prepend, or find-replace. |
-| `edit_files` | Apply bounded exact edits across multiple existing text files with preflight validation and rollback. |
+| `edit_files` | Preview or apply exact edits or ordered file operations with virtual preflight, rollback, and grouped undo. |
 | `delete_file` | Delete one file with structured success/error metadata. |
 | `list_history` | List metadata for recent process-local write snapshots without returning file contents. |
-| `undo_change` | Restore one recorded before-snapshot when the current path still matches its recorded after-state. |
+| `undo_change` | Restore one `entry_id` or a complete `change_set_id` after checking every affected path. |
 
 With `target_line_ending="preserve"`, `edit_file` normalizes appended, prepended, and find-replace fragments to an existing LF or CRLF file. Responses include `line_endings_normalized` and `mixed_line_endings`; mixed files are reported without silently rewriting their existing line endings.
 
 `edit_file` and `convert_file_format` preserve the detected existing encoding when `target_encoding` is omitted. They support UTF-8, BOM-tagged UTF-16LE/UTF-16BE, and Windows-1252; responses expose `previous_encoding`, `target_encoding`, and `encoding_changed` when an explicit conversion is requested.
 
-`edit_files` accepts up to 20 files and 100 ordered exact edits per call. Every edit requires `expected_replacements`; all paths, counts, encodings, and supported JSON/Tree-sitter syntax are preflighted before any write. Changed files are written atomically one at a time, with earlier writes rolled back if a later write fails. This is rollback-backed transaction behavior, not a filesystem-wide atomic commit.
+`edit_files` accepts exactly one of `files` (the existing exact-edit format) or `operations` (ordered `edit`, `create`, `delete`, `copy`, `move`, `transfer`, and `mkdir` steps). Calls are bounded to 20 unique paths and 100 operations/exact edits; retained file snapshots are limited to 10 MiB each. Every exact edit requires `expected_replacements`. Operations run against virtual contents, so moving A to B and then editing B works in one call. Parents must exist on disk or be declared by an earlier `mkdir` step, and paths must use one spelling each. `mkdir` creates one directory per step; use explicit steps for nested parents. Existing directories are accepted by default (`allow_existing=false` rejects them) and are never included as new directory creations in history. Other operations support regular files; final-component symlinks and Windows reparse points are excluded. New directories count toward the 20-path limit, participate in previews and grouped undo, and are created before files during commit. Undo removes tracked children before their directories; it refuses the complete group before restoring any path if a directory contains an entry outside that group. Copy/move steps require a missing destination; overwriting via a create step requires `overwrite=true` and `expected_hash`. Syntax validation checks final contents against each file's original baseline. Copy/move carries the source baseline through subsequent operations, so unchanged JSONC or preexisting parse errors remain permissible; fresh/generated content does not inherit that exemption.
 
-`file_hash` and `read_file_range` compute a full-file SHA-256 digest with bounded-memory streaming I/O. `edit_file`, `delete_file`, and each `edit_files.files` entry accept that digest as `expected_hash`; stale or malformed preconditions are rejected before mutation, and single-file tools recheck the digest immediately before writing or deleting. Successful edit responses include before/after digests.
+Set `dry_run=true` on `edit_files`, `copy_file`, or `move_file` to inspect the planned changes without filesystem writes or new history entries. Exact-edit and operations previews return at most 2 KiB of diff per path, with explicit truncation; inputs over the 1 MiB diff limit return `diff_skipped`. Critical-path previews retain risk warnings and do not require write acknowledgement. Existing files are replaced atomically one at a time. On Unix, existing-file replacements and standalone `copy_file`/`move_file` transfers are created with the known desired permission mode before bytes are written; the same applies to their exclusive-create publication. Umask may narrow that mode. A later fchmod is best-effort; failure reports `permissions_preserved=false` while retaining the initial mode rather than a broader default mode. Replacements require readable permission metadata before creating a temporary file. This status is retained by single-file writes, each affected `edit_files` result, format conversion, and undo. New files use a native no-replace rename (Linux/macOS/Windows), then hard links where supported, then Unix exclusive creation with `create_new(true)` and fsync. Exclusive creation preserves no-overwrite but readers may see a partial new file; affected responses include `publication_atomic=false`. This fallback applies to `create_file`, `edit_file create_if_missing`, operations, copy/move, and undo restoring a deleted file. Source deletions in operations follow completed destination writes. Failed commits or group restores roll back completed changes only when their current contents still match; incomplete rollback is reported. This is not a filesystem-wide atomic transaction. Hash checks are optimistic conflict checks and do not exclude independent writers during the final OS operation.
 
-Successful write responses are compact and omit redundant `success`, `message`, and default-valued status fields. File mutations return `path`, `history_entry_id`, and `sha256_after` when a file exists after the operation, plus operation-specific fields such as `replacements`, `bytes_removed`, or `undone_entry_id`; exceptional conditions are reported only when they occur. `edit_files` applies the same contract to each changed file instead of repeating default encoding, validation, and history metadata.
+A `transfer` operation uses `source`, `destination`, `action: "copy" | "move"`, inclusive one-based `start_line`/`end_line`, and `insert_before_line` (line count plus one means EOF). Source `expected_hash` is mandatory; transfers between different paths also require `destination_expected_hash`. Hashes and line positions refer to the virtual state immediately before that step. In the same file, insertion coordinates refer to the contents before removal; insertion inside a moved range is rejected. Transfers preserve each file's encoding/BOM and use the destination's uniform LF/CRLF style. Unterminated lines that would merge with adjacent content are rejected. File transfers do not rewrite imports or references.
+
+```json
+{
+  "operations": [
+    {"op": "mkdir", "path": "src/newmod"},
+    {"op": "move", "source": "src/old.rs", "destination": "src/newmod/renamed.rs"},
+    {"op": "edit", "path": "src/newmod/renamed.rs", "edits": [
+      {"find": "old_name", "replace": "new_name", "expected_replacements": 1}
+    ]}
+  ],
+  "dry_run": true
+}
+```
+
+`copy_file` and `move_file` use `source`, `destination`, and optional source `expected_hash`. They support regular files including binary and files larger than the snapshot limit, require an existing destination parent, and never overwrite. Case-only rename is supported when both names resolve to the same file. Cross-device moves stream into a destination-side temporary file, flush it, verify hashes, publish it, and only then remove the source. No-overwrite publication tries the native primitive first, then a hard link, and finally Unix exclusive creation when those primitives are unavailable (including link EPERM on FAT/FUSE). Cleanup checks the created inode and preserves a replacement at the same path. Copy/move responses report `publication_atomic=false` when exclusive creation was needed; move still verifies and flushes the completed destination before removing the source. Unix permission-mode copying is best-effort: copy/move and inverse move responses include `permissions_preserved=false` if the source mode could not be retained. New byte writes keep default creation permissions and do not require chmod. These operations preserve file bytes; ACLs, extended attributes, and timestamps are not a metadata-preservation contract.
+
+For optional suggestions, pass `reference_hints` to `move_file`. Its required `paths` contains 1..8 existing files or directories; optional `includes`/`excludes` use the same globs as `text_search`. `max_results` defaults to 20 and is limited to 1..100 matched lines, with a deduplicated list of files. The tool performs case-sensitive literal searches for the old filename and module stem; for `mod.rs`, `index.*`, or `__init__.py`, the parent directory supplies the module name. Search respects the normal hidden/ignored/generated-file defaults and large-root fallback guard. Suggestions run before the move, exclude the transferred file, and are returned for both dry-run and apply. After updating the server binary, reconnect clients to load the extended tool schemas. The response marks them `kind="lexical"` and `timing="before_move"`, with `complete`, `limit_reached`, and any search issues; a partial or unavailable search is advisory and never means that no references remain. Comments, strings, and unrelated identifiers may match. Imports are not changed automatically.
+
+```json
+{
+  "source": "src/old.rs",
+  "destination": "src/new.rs",
+  "dry_run": true,
+  "reference_hints": {
+    "paths": ["src"],
+    "includes": ["**/*.rs"],
+    "max_results": 20
+  }
+}
+```
+
+For a symbol rename using existing tools:
+
+1. Run `find_references` and inspect the reported code/comment/string occurrences. It matches tokens and does not resolve bindings; select the occurrences intended for this rename.
+2. Read the selected files and capture their hashes. Prepare one `edit_files` call with exact replacements, `expected_replacements`, and each file's `expected_hash`; call it with `dry_run=true` and review the diffs.
+3. Apply the same call with `dry_run=false`. If a hash conflicts, reread the file and update the preview.
+4. Use the returned `change_set_id` with `undo_change` to revert the complete rename when needed.
+
+`diff_files` accepts `left` and `right`, each containing exactly one of `path`, `content`, or `entry_id`. A history selector also requires `snapshot: "before" | "after"`; a missing-file snapshot represents empty content. Text inputs are limited to 1 MiB per side, binary inputs are rejected, and `max_output_bytes` controls the unified diff (256 bytes through 64 KiB, default 64 KiB). Truncation reports `output_truncated` and `omitted_bytes`. Diff alignment has a bounded computation deadline and may be less minimal for complex inputs. Hash-only history returns `snapshot_content_unavailable` instead of reading current file content as a substitute.
+
+`file_hash` and `read_file_range` compute a full-file SHA-256 digest with bounded-memory streaming I/O. `edit_file`, `delete_file`, `create_file` with `overwrite=true`, and each `edit_files.files` entry accept that digest as `expected_hash`; stale or malformed preconditions are rejected before mutation, and single-file tools recheck the digest immediately before writing or deleting. Successful edit responses include before/after digests.
+
+Successful existing write responses are compact and omit redundant `success`, `message`, and default-valued status fields. File mutations return `path`, `history_entry_id`, and `sha256_after` when a file exists after the operation, plus operation-specific fields such as `replacements`, `bytes_removed`, or `undone_entry_id`; exceptional conditions are reported only when they occur. `edit_files` adds a `change_set_id` for grouped undo; operations also return before/after states. Copy/move responses return both paths, the verified hash, the method, and history IDs.
 
 Write authorization uses the `risk_aware` scope. Paths inside exact declared MCP/CLI/environment roots are written without a location warning. Other targets receive one short warning based on the highest detected risk: `low` outside known write roots, `medium` elsewhere in an inferred repository, `high` for configured sensitive patterns or a detected symlink/junction target, and `critical` for `.git`, sensitive home credential/profile locations, protected operating-system directories, or canonical escapes from a declared root/repository. Low, medium, and high-risk writes proceed immediately. A critical-risk call returns `risk_confirmation_required` before mutation; retry the same call with `acknowledge_risk=true` to proceed while retaining the warning. Sensitive hash-mismatch responses do not expose `actual_hash`. History entries outside declared roots include `outside_declared: true`; `workspace_index` controls indexing only and does not declare a write root.
 
 `validate_json` performs streaming syntax validation without materializing the document. It accepts exactly one UTF-8 file path or inline JSON string, reports parser line/column details for invalid input, and does not perform JSON Schema validation.
 
-Write history is in memory and local to the running server process. It retains at most 200 entries and 256 MiB of snapshot bytes, evicting the oldest entries first. `list_history` returns metadata only, and `undo_change` refuses to overwrite a path whose current contents or canonical location no longer match the recorded after-snapshot. History does not survive a server restart.
+Write history is in memory and local to the running server process. Restarting or upgrading loses it. It retains at most 200 entries and 256 MiB of snapshot bytes; complete change sets are registered together and evicted together. A group that exceeds the history budget is not retained, and its response reports `history_recorded=false`. `list_history` returns metadata, including `change_set_id` and whether contents were retained. `undo_change` accepts exactly one `entry_id` or `change_set_id`. An `entry_id` in a multi-entry group is rejected with `partial_undo_requires_opt_in` and its `change_set_id`; use that group ID to undo the complete change. Intentional single-entry undo requires `allow_partial=true` and returns `partial_undo=true`, `partial_change_set_id`, and a warning that other group members remain changed. Group undo checks all current states and canonical locations before restoring any path and supports rollback on restore failure. Standalone copy history retains only a hash: undo can safely remove an unchanged copy, but cannot redo that removal or diff its contents. Standalone move history records the inverse move: undo requires the moved file to match its recorded hash and the original source path to be free (except for case-only rename). Retained byte snapshots support undoing an undo through its returned history ID.
 
 `read_file_range` supports line ranges, `tail` for the final N lines, bounded `start_byte` windows for very long lines, and streaming `json_pointer` selection using RFC 6901. Text responses remove a leading BOM, normalize CRLF and classic CR line endings to LF, report `bom`/`is_binary`, and never return NUL-containing binary content. Line, tail, and `start_byte` reads default to a 64 KiB output window when `max_bytes` is omitted; oversized first lines return a prefix with `line_truncated: true` and `next_start_byte`. `json_pointer` defaults to a 1 MiB serialized-value budget. `read_snippets` accepts the same per-request selectors and returns line- or byte-based continuations.
 

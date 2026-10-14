@@ -32,6 +32,10 @@ pub async fn execute(args: &Value) -> Result<Value> {
         .map(|record| {
             json!({
                 "entry_id": record.entry_id,
+                "change_set_id": record.change_set_id,
+                "move_destination": record.move_link.as_ref().map(|link| &link.destination),
+                "before_content_retained": record.before.bytes.is_some(),
+                "after_content_retained": record.after.bytes.is_some(),
                 "tool": record.tool_name,
                 "path": crate::common::normalize_display_path(std::path::Path::new(&record.path)),
                 "canonical_path": crate::common::normalize_display_path(std::path::Path::new(&record.canonical_path)),

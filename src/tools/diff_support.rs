@@ -2,7 +2,9 @@ use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 
 pub fn build_diff_payload(left: &str, right: &str, left_label: &str, right_label: &str) -> Value {
-    let diff = TextDiff::from_lines(left, right);
+    let diff = TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(500))
+        .diff_lines(left, right);
     let unified_diff = diff
         .unified_diff()
         .context_radius(3)

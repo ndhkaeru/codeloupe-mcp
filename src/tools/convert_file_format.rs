@@ -136,10 +136,11 @@ pub async fn execute(args: &Value) -> Result<Value> {
         )
     };
 
-    let write_result = crate::tools::atomic_write::write_bytes(&path, &final_bytes, true);
+    let write_result =
+        crate::tools::atomic_write::write_bytes_with_status(&path, &final_bytes, true);
 
     match write_result {
-        Ok(_) => {
+        Ok(publication) => {
             let mut response = json!({
                 "success": true,
                 "path": crate::common::normalize_display_path(&path),
@@ -154,6 +155,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
                     target_encoding.canonical_name()
                 )
             });
+            publication.attach(&mut response);
             attach_history_metadata(&mut response, &history_outcome);
             Ok(response)
         }

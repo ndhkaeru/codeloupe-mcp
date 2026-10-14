@@ -248,6 +248,7 @@ dependencies = [
  "heed",
  "ignore",
  "lazy_static",
+ "libc",
  "mcp-sdk",
  "regex",
  "serde",

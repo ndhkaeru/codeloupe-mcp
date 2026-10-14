@@ -1101,6 +1101,8 @@ fn observe_tool_workspaces(tool_name: &str, params: &Value) {
             | "create_directory"
             | "edit_file"
             | "edit_files"
+            | "copy_file"
+            | "move_file"
             | "delete_file"
             | "convert_file_format"
             | "batch_tool_call"

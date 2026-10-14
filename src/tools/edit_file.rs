@@ -596,14 +596,25 @@ pub async fn execute(args: &Value) -> Result<Value> {
         }
     }
 
-    if let Err(err) = crate::tools::atomic_write::write_bytes(&path, &final_bytes, existed_before) {
-        return Ok(io_error_response(
-            &path,
-            &canonical_from_guard,
-            "write file atomically",
-            &err,
-        ));
-    }
+    let publication = match crate::tools::atomic_write::write_bytes_with_status(
+        &path,
+        &final_bytes,
+        existed_before,
+    ) {
+        Ok(publication) => publication,
+        Err(err) => {
+            return Ok(io_error_response(
+                &path,
+                &canonical_from_guard,
+                if existed_before {
+                    "replace existing file"
+                } else {
+                    "publish new file without replacing an unexpected destination"
+                },
+                &err,
+            ));
+        }
+    };
 
     let canonical_after = std::fs::canonicalize(&path).unwrap_or(canonical_from_guard);
     let before_snapshot = if existed_before {
@@ -653,6 +664,7 @@ pub async fn execute(args: &Value) -> Result<Value> {
         "sha256_after": sha256_after,
         "message": if existed_before { "file updated" } else { "file created and updated" }
     });
+    publication.attach(&mut response);
     attach_history_metadata(&mut response, &history_outcome);
     Ok(response)
 }
